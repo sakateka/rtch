@@ -1,0 +1,23 @@
+[package]
+name = "rtch"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Persistent terminal sessions with transparent live output"
+license = "MIT"
+
+[dependencies]
+libc = "=0.2.189"
+clap = "=4.6.6"
+clap_complete = { version = "=4.6.9", features = ["unstable-dynamic"] }
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = true
+strip = true
