@@ -122,7 +122,7 @@ fn setting(id: &'static str, short: char, help: &'static str) -> Arg {
 pub fn command() -> Command {
     let mut cmd=Command::new("rtch").version(env!("CARGO_PKG_VERSION"))
         .about("Persistent terminal sessions; ended sessions require an explicit new")
-        .after_help("Config: ~/.config/rtch/config — session_dir = /absolute/path\nWithout PROGRAM, starts $SHELL. Ctrl+\\ detaches; or run rtch detach SESSION elsewhere.")
+        .after_help("Config: ~/.config/rtch/config — session_dir = /absolute/path\nWithout PROGRAM, starts $SHELL as a login shell. Ctrl+\\ detaches; or run rtch detach SESSION elsewhere.")
         .subcommand_negates_reqs(true)
         .arg(session(Sessions::All)).arg(program())
         .arg(setting("quiet",'q',"Suppress status messages").global(true))

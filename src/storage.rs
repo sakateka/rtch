@@ -4,6 +4,7 @@ use std::os::unix::{
     net::{UnixListener, UnixStream},
 };
 use std::{
+    collections::VecDeque,
     env,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -41,10 +42,10 @@ pub fn resolve(path: &Path) -> Result<PathBuf> {
     if let Ok(canonical) = path.canonicalize() {
         return Ok(canonical);
     }
-    if let Some(parent) = path.parent() {
-        if let Ok(parent) = parent.canonicalize() {
-            return Ok(parent.join(name));
-        }
+    if let Some(parent) = path.parent()
+        && let Ok(parent) = parent.canonicalize()
+    {
+        return Ok(parent.join(name));
     }
     Ok(path)
 }
@@ -145,8 +146,9 @@ pub fn open_file(path: &Path, write: bool) -> io::Result<File> {
 pub struct Log {
     file: Option<File>,
     pub cap: usize,
-    pub history: Vec<u8>,
+    pub history: VecDeque<u8>,
     filter: Filter,
+    written: u64,
 }
 impl Log {
     pub fn open(path: &Path, cap: usize) -> Result<Self> {
@@ -158,8 +160,9 @@ impl Log {
         let mut result = Self {
             file,
             cap,
-            history: vec![],
+            history: VecDeque::new(),
             filter: Filter::default(),
+            written: 0,
         };
         if let Some(f) = &mut result.file {
             let len = f.metadata()?.len();
@@ -167,32 +170,35 @@ impl Log {
             f.seek(SeekFrom::Start(offset))?;
             let mut bytes = Vec::new();
             f.take(cap as u64).read_to_end(&mut bytes)?;
-            result.history = result.filter.feed(&bytes);
+            result.filter.feed_into(&bytes, &mut result.history);
             if len > cap as u64 {
                 f.set_len(0)?;
                 f.seek(SeekFrom::Start(0))?;
                 f.write_all(&bytes)?;
             }
-            f.seek(SeekFrom::End(0))?;
+            result.written = f.seek(SeekFrom::End(0))?;
         }
         Ok(result)
     }
     pub fn append(&mut self, bytes: &[u8]) -> Result<()> {
-        self.history.extend(self.filter.feed(bytes));
+        self.filter.feed_into(bytes, &mut self.history);
         let keep = if self.cap == 0 { 128 * 1024 } else { self.cap };
         if self.history.len() > keep {
             self.history.drain(..self.history.len() - keep);
         }
         if let Some(f) = &mut self.file {
             f.write_all(bytes)?;
-            if f.stream_position()? > self.cap.saturating_mul(2) as u64 {
-                let len = f.metadata()?.len();
-                f.seek(SeekFrom::Start(len.saturating_sub(self.cap as u64)))?;
+            self.written += bytes.len() as u64;
+            if self.written > self.cap.saturating_mul(2) as u64 {
+                f.seek(SeekFrom::Start(
+                    self.written.saturating_sub(self.cap as u64),
+                ))?;
                 let mut recent = Vec::with_capacity(self.cap);
                 f.take(self.cap as u64).read_to_end(&mut recent)?;
                 f.set_len(0)?;
                 f.seek(SeekFrom::Start(0))?;
                 f.write_all(&recent)?;
+                self.written = recent.len() as u64;
             }
         }
         Ok(())
@@ -203,6 +209,7 @@ impl Log {
         if let Some(f) = &mut self.file {
             f.set_len(0)?;
             f.rewind()?;
+            self.written = 0;
         }
         Ok(())
     }

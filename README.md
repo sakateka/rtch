@@ -9,6 +9,8 @@
 
 ## Сборка и установка
 
+Требуется stable Rust 1.88 или новее.
+
 ```sh
 cargo build --release --locked
 install -Dm755 target/release/rtch ~/.local/bin/rtch
@@ -23,7 +25,9 @@ rtch [OPTIONS] SESSION [PROGRAM [ARGS...]]
 rtch [OPTIONS] COMMAND [COMMAND_OPTIONS] [SESSION] [PROGRAM [ARGS...]]
 ```
 
-Без `PROGRAM` запускается `$SHELL`, при отсутствии переменной — `/bin/sh`.
+Без `PROGRAM` запускается `$SHELL` (или `/bin/sh`) как login-shell.
+Bash читает `~/.profile`, если его не перекрывают `~/.bash_profile` или `~/.bash_login`.
+Явные программы сохраняют правила запуска; переподключение не перечитывает профиль.
 Опции rtch указываются до `PROGRAM`; последующие аргументы передаются программе.
 
 ```sh
@@ -168,8 +172,14 @@ UID не защищают от процессов того же пользова
 ```sh
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
+RTCH_IO_BACKEND=poll cargo test --locked
+RTCH_IO_BACKEND=uring cargo test --locked
 ```
 
 `cargo test` запускает и модульные, и интеграционные тесты. Нужны Bash,
 стандартные утилиты Linux, Unix-сокеты и `/dev/ptmx`. Тесты используют
 временные каталоги и завершают только собственные сессии.
+
+Механизм I/O: `RTCH_IO_BACKEND=auto` (по умолчанию) ожидает события через io_uring
+на Linux 5.11+ и переходит на `poll` при недоступности. `uring` требует io_uring;
+`poll` включает совместимый режим. Чтение и запись остаются синхронными.

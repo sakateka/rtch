@@ -4,6 +4,7 @@ use crate::{
     fail, os,
     storage::{self, Log, State},
 };
+use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
 use std::{
     collections::VecDeque,
@@ -34,9 +35,12 @@ pub fn resize_packet(kind: u8) -> [u8; 10] {
     let w = os::size(0);
     let mut p = [0; 10];
     p[0] = kind;
-    for (dest, n) in p[2..]
-        .chunks_exact_mut(2)
-        .zip([w.ws_row, w.ws_col, w.ws_xpixel, w.ws_ypixel])
+    for (dest, n) in
+        p[2..]
+            .as_chunks_mut::<2>()
+            .0
+            .iter_mut()
+            .zip([w.ws_row, w.ws_col, w.ws_xpixel, w.ws_ypixel])
     {
         dest.copy_from_slice(&n.to_ne_bytes());
     }
@@ -76,9 +80,10 @@ impl Drop for ChildGuard {
     }
 }
 
-// One poll loop owns all session I/O; splitting it obscures event ordering.
+// One event loop owns all session I/O; splitting it obscures event ordering.
 #[allow(clippy::too_many_lines)]
 pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result<i32> {
+    let mut reactor = crate::reactor::Reactor::new()?;
     storage::ensure_parent(path)?;
     match storage::state(path)? {
         State::Running | State::Attached => return fail("session is already running"),
@@ -101,7 +106,16 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
     let mut cmd = if let Some(p) = o.program.first() {
         Command::new(p)
     } else {
-        Command::new(std::env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into()))
+        let shell = std::env::var_os("SHELL")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".into());
+        let mut login_name = std::ffi::OsString::from("-");
+        login_name.push(Path::new(&shell).file_name().ok_or("invalid SHELL path")?);
+        let mut command = Command::new(shell);
+        // The leading '-' requests the shell's native login startup files;
+        // functions from .profile stay in the interactive shell itself.
+        command.arg0(login_name);
+        command
     };
     if !o.program.is_empty() {
         cmd.args(&o.program[1..]);
@@ -141,6 +155,7 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
     let mut ended_at = None;
     let mut shutdown = None;
     let mut marked_attached = false;
+    let mut fds = Vec::with_capacity(66);
     loop {
         let signals = os::take_signals();
         if signals & 1 != 0 && shutdown.is_none() {
@@ -178,7 +193,8 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
             )?;
             marked_attached = attached;
         }
-        let mut fds = vec![
+        fds.clear();
+        fds.extend([
             libc::pollfd {
                 fd: listener.as_raw_fd(),
                 events: libc::POLLIN,
@@ -194,7 +210,7 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                 },
                 revents: 0,
             },
-        ];
+        ]);
         for c in &clients {
             fds.push(libc::pollfd {
                 fd: c.stream.as_raw_fd(),
@@ -207,10 +223,10 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                 revents: 0,
             });
         }
-        os::poll(&mut fds, 100)?;
+        reactor.wait(&mut fds, 100)?;
         let mut detach_all = false;
         for (c, pfd) in clients.iter_mut().zip(&fds[2..]) {
-            if pfd.revents & libc::POLLIN != 0 {
+            if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 let mut buf = [0; 8192];
                 match c.stream.read(&mut buf) {
                     Ok(0) => c.close = true,
@@ -220,20 +236,28 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                             .contains(&e.kind()) => {}
                     Err(_) => c.close = true,
                 }
-                let complete = c.input.len() / 10 * 10;
-                for p in c.input[..complete].chunks_exact(10) {
+                let (packets, remainder) = c.input.as_chunks::<10>();
+                let complete = c.input.len() - remainder.len();
+                for p in packets {
                     match p[0] {
                         PUSH if p[1] <= 8 && !pty_done => {
-                            if input.len() > 1024 * 1024 {
+                            if input.len() + usize::from(p[1]) > 1024 * 1024 {
                                 c.close = true;
                                 break;
                             }
                             input.extend(&p[2..2 + usize::from(p[1])]);
                         }
-                        ATTACH => {
+                        ATTACH if !c.attached => {
                             c.attached = true;
+                            if c.output.len() + log.history.len()
+                                > o.cap.saturating_add(8 * 1024 * 1024)
+                            {
+                                c.close = true;
+                                break;
+                            }
                             c.output.extend(&log.history);
                         }
+                        ATTACH => {}
                         SUSPEND => c.attached = false,
                         WINCH | REDRAW => {
                             os::set_size(master.as_raw_fd(), winsize(p))?;
@@ -267,7 +291,13 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                             c.output.extend(b"OK");
                             c.finishing = true;
                         }
-                        _ => c.close = true,
+                        _ => {
+                            c.close = true;
+                            break;
+                        }
+                    }
+                    if c.finishing {
+                        break;
                     }
                 }
                 c.input.drain(..complete);
@@ -287,7 +317,9 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                     Err(_) => c.close = true,
                 }
             }
-            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            // HUP can accompany unread packets after `push` exits. Drain to
+            // read(0) before closing, otherwise a batched input loses its tail.
+            if pfd.revents & libc::POLLNVAL != 0 {
                 c.close = true;
             }
         }
@@ -297,6 +329,9 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                     c.close = true;
                 }
             }
+        }
+        for c in clients.iter().filter(|c| c.close) {
+            reactor.remove(c.stream.as_raw_fd())?;
         }
         clients.retain(|c| !c.close);
         if fds[1].revents & libc::POLLOUT != 0 && !input.is_empty() {

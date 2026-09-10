@@ -85,6 +85,8 @@ impl Sessions {
     fn command(&self, program: &str) -> Command {
         let mut cmd = Command::new(program);
         cmd.env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("HOME", &self.root)
+            .env("SHELL", "/bin/bash")
             .env_remove("RTCH_SESSION")
             .env_remove("ATCH_SESSION")
             .env_remove("COMPLETE");
@@ -255,6 +257,60 @@ fn ended_and_no_implicit_restart() {
     s.ok(&["rm", "-a"]);
     assert!(!s.sessions.join("finished.log").exists());
     assert!(!s.sessions.join("finished.ended").exists());
+}
+
+#[test]
+fn default_shell_loads_profile_functions_once_and_reattach_keeps_them() {
+    let s = Sessions::new();
+    fs::write(s.root.join(".profile"),
+        "export RTCH_PROFILE_TEST=loaded\nprintf x >> \"$HOME/profile-count\"\nz() { printf 'PROFILE_%s_FUNCTION\\n' \"$RTCH_PROFILE_TEST\"; }\n").unwrap();
+    let mut c = s.attach(&["profile"]);
+    wait_for(|| s.root.join("profile-count").exists() && s.sessions.join("profile").exists());
+    s.push("profile", b"z\n");
+    c.read_until(b"PROFILE_loaded_FUNCTION");
+    c.detach();
+    let mut c = s.attach(&["attach", "profile"]);
+    s.push(
+        "profile",
+        b"z; printf 'AGAIN_%s\\n' \"$RTCH_PROFILE_TEST\"\n",
+    );
+    c.read_until(b"AGAIN_loaded");
+    assert_eq!(fs::read(s.root.join("profile-count")).unwrap(), b"x");
+    c.detach();
+
+    // Explicit programs keep their own startup semantics and literal arguments.
+    s.ok(&[
+        "start",
+        "explicit",
+        "printf",
+        "%s",
+        "literal $HOME; 'argument'",
+    ]);
+    s.ended("explicit");
+    assert_eq!(
+        text(&s.ok(&["tail", "explicit"])),
+        "literal $HOME; 'argument'"
+    );
+    assert_eq!(fs::read(s.root.join("profile-count")).unwrap(), b"x");
+}
+
+#[test]
+fn batched_push_preserves_packets_after_writer_disconnects() {
+    let s = Sessions::new();
+    s.ok(&[
+        "start",
+        "batch",
+        "sh",
+        "-c",
+        "stty raw -echo; printf READY; head -c 32771; sleep 60",
+    ]);
+    wait_for(|| contains(&s.log("batch"), b"READY"));
+    let payload: Vec<_> = (0..32771)
+        .map(|i| b'a' + u8::try_from(i % 26).unwrap())
+        .collect();
+    s.push("batch", &payload);
+    wait_for(|| s.log("batch").len() >= 5 + payload.len());
+    assert_eq!(&s.log("batch")[5..], payload);
 }
 #[test]
 fn detach_hup_resets_keyboard_and_termios() {

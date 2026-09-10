@@ -9,6 +9,8 @@ terminal emulation and pane management are not implemented.
 
 ## Build and install
 
+Requires stable Rust 1.88 or newer.
+
 ```sh
 cargo build --release --locked
 install -Dm755 target/release/rtch ~/.local/bin/rtch
@@ -23,7 +25,9 @@ rtch [OPTIONS] SESSION [PROGRAM [ARGS...]]
 rtch [OPTIONS] COMMAND [COMMAND_OPTIONS] [SESSION] [PROGRAM [ARGS...]]
 ```
 
-Without `PROGRAM`, rtch starts `$SHELL`, falling back to `/bin/sh` if unset.
+Without `PROGRAM`, rtch starts `$SHELL` (or `/bin/sh`) as a login shell.
+Bash loads `~/.profile` unless `~/.bash_profile` or `~/.bash_login` takes precedence.
+Explicit programs retain their startup behavior; reattaching does not reload profiles.
 rtch options precede `PROGRAM`; subsequent arguments are passed to the program.
 
 ```sh
@@ -166,8 +170,14 @@ against processes running as the same user.
 ```sh
 cargo test --locked
 cargo clippy --all-targets --locked -- -D warnings
+RTCH_IO_BACKEND=poll cargo test --locked
+RTCH_IO_BACKEND=uring cargo test --locked
 ```
 
 `cargo test` runs both unit and integration tests. Requires Bash, standard
 Linux utilities, Unix sockets, and `/dev/ptmx`. Tests use temporary directories
 and terminate only their own sessions.
+
+I/O backend: `RTCH_IO_BACKEND=auto` (default) uses io_uring readiness on
+Linux 5.11+ and falls back to `poll` if unavailable. `uring` requires io_uring;
+`poll` forces compatibility mode. Reads and writes remain synchronous.

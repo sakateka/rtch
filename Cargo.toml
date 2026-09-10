@@ -2,7 +2,7 @@
 name = "rtch"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "Persistent terminal sessions with transparent live output"
 license = "MIT"
 
@@ -10,14 +10,17 @@ license = "MIT"
 libc = "=0.2.189"
 clap = "=4.6.6"
 clap_complete = { version = "=4.6.9", features = ["unstable-dynamic"] }
+io-uring = "=0.7.15"
 
 [lints.rust]
 unsafe_code = "warn"
 
 [lints.clippy]
-all = "warn"
-pedantic = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "deny"
 
 [profile.release]
 lto = true
+codegen-units = 1
 strip = true

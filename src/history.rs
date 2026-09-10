@@ -9,6 +9,11 @@ const ESC: u8 = 27;
 impl Filter {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(bytes.len() + self.seq.len());
+        self.feed_into(bytes, &mut out);
+        out
+    }
+
+    pub fn feed_into(&mut self, bytes: &[u8], out: &mut impl Extend<u8>) {
         for &c in bytes {
             if self.state == 0 {
                 if c == ESC {
@@ -17,7 +22,7 @@ impl Filter {
                     self.state = 1;
                     self.overflow = false;
                 } else if c != 5 {
-                    out.push(c);
+                    out.extend([c]);
                 }
                 continue;
             }
@@ -83,13 +88,12 @@ impl Filter {
                         .any(|w| w[0] == b';' && w[1] == b'?' && [b';', 7, ESC].contains(&w[2]));
                 }
                 if keep && !self.overflow {
-                    out.extend_from_slice(&self.seq);
+                    out.extend(self.seq.iter().copied());
                 }
                 self.state = 0;
                 self.seq.clear();
             }
         }
-        out
     }
 }
 #[cfg(test)]

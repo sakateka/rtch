@@ -98,6 +98,7 @@ pub fn attach(o: &Options, path: &Path) -> Result<()> {
     let mut output = VecDeque::new();
     let mut done = false;
     let mut detached = false;
+    let mut reactor = crate::reactor::Reactor::new()?;
     loop {
         let signals = os::take_signals();
         if signals & 1 != 0 {
@@ -131,7 +132,7 @@ pub fn attach(o: &Options, path: &Path) -> Result<()> {
                 revents: 0,
             },
         ];
-        os::poll(&mut fds, 100)?;
+        reactor.wait(&mut fds, 100)?;
         if fds[0].revents & libc::POLLIN != 0 {
             let mut buf = [0; 4096];
             let n = os::read(0, &mut buf)?;
@@ -201,8 +202,18 @@ pub fn attach(o: &Options, path: &Path) -> Result<()> {
     Ok(())
 }
 fn push_bytes(stream: &mut std::os::unix::net::UnixStream, buf: &[u8]) -> Result<()> {
-    for chunk in buf.chunks(8) {
-        stream.write_all(&server::packet(server::PUSH, chunk))?;
+    // Keep the existing ten-byte wire format, but submit packets in batches.
+    let mut packets = [0; 10 * 1024];
+    for batch in buf.chunks(8 * 1024) {
+        for (dest, chunk) in packets
+            .as_chunks_mut::<10>()
+            .0
+            .iter_mut()
+            .zip(batch.chunks(8))
+        {
+            dest.copy_from_slice(&server::packet(server::PUSH, chunk));
+        }
+        stream.write_all(&packets[..batch.len().div_ceil(8) * 10])?;
     }
     Ok(())
 }

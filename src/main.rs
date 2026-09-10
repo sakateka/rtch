@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod history;
 mod os;
+mod reactor;
 mod server;
 mod storage;
 use std::{
