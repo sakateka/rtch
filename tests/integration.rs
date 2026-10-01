@@ -129,9 +129,11 @@ impl Drop for Process {
         let _ = self.0.wait();
     }
 }
+#[allow(clippy::struct_field_names)]
 struct Sessions {
     root: PathBuf,
     sessions: PathBuf,
+    tracked_jobs: Vec<os::ChildSession>,
 }
 impl Sessions {
     fn new() -> Self {
@@ -144,7 +146,11 @@ impl Sessions {
         let sessions = root.join("sessions");
         fs::create_dir(&sessions).unwrap();
         fs::create_dir_all(root.join("config/rtch")).unwrap();
-        let suite = Self { root, sessions };
+        let suite = Self {
+            root,
+            sessions,
+            tracked_jobs: Vec::new(),
+        };
         suite.config("");
         suite
     }
@@ -204,6 +210,11 @@ impl Sessions {
     fn log(&self, name: &str) -> Vec<u8> {
         decoded(self.sessions.join(format!("{name}.log")))
     }
+    fn track_jobs(&mut self, name: &str) {
+        let socket = UnixStream::connect(self.sessions.join(name)).unwrap();
+        self.tracked_jobs
+            .push(os::ChildSession::identify(&socket).unwrap());
+    }
     fn attach(&self, args: &[&str]) -> Client {
         Self::terminal(
             self.command(BINARY)
@@ -258,6 +269,11 @@ impl Sessions {
 }
 impl Drop for Sessions {
     fn drop(&mut self) {
+        // Retain identities so a failed assertion cannot leak background jobs
+        // after the supervisor has removed this private session's socket.
+        for session in self.tracked_jobs.drain(..) {
+            let _ = session.kill();
+        }
         if let Ok(entries) = fs::read_dir(&self.sessions) {
             for entry in entries.flatten() {
                 if entry.file_type().is_ok_and(|t| t.is_socket()) {
@@ -325,6 +341,32 @@ impl Client {
             (o.c_iflag, o.c_oflag, o.c_cflag, o.c_lflag, o.c_cc)
         );
     }
+}
+
+fn picker_reporting_enabled(output: &[u8]) {
+    assert!(contains(output, b"\x1b[?1049h\x1b[>5u\x1b[?4m\x1b[>4;2m"));
+}
+
+fn picker_reporting_restored(output: &[u8]) {
+    picker_reporting_restored_to(output, b"\x1b[>4m");
+}
+
+fn picker_reporting_restored_to(output: &[u8], mode: &[u8]) {
+    let mut restore = b"\x1b[<u".to_vec();
+    restore.extend_from_slice(mode);
+    assert!(contains(output, &restore));
+    let pop = output
+        .windows(4)
+        .position(|part| part == b"\x1b[<u")
+        .unwrap();
+    let screen = output
+        .windows(8)
+        .position(|part| part == b"\x1b[?1049l")
+        .unwrap();
+    assert!(
+        pop < screen,
+        "keyboard modes must be restored before leaving the picker"
+    );
 }
 
 #[test]
@@ -830,7 +872,7 @@ fn picker_recency_selection_english_russian_navigation_and_fragmented_keys() {
     assert!(screen.row(4).contains("> slot-08") && screen.row(4).contains("[ended]"));
     assert!(contains(&out, b"BEGIN-8") && contains(&out, b"END-8"));
     assert!(!contains(&out, b"BEGIN-9"));
-    c.master.write_all(b"k").unwrap();
+    c.master.write_all(b"\x1b[A").unwrap();
     let out = c.read_until(b"scroll");
     screen.feed(&out);
     assert!(screen.row(3).contains("> slot-09"));
@@ -840,7 +882,7 @@ fn picker_recency_selection_english_russian_navigation_and_fragmented_keys() {
     screen.feed(&out);
     assert!(screen.row(4).contains("> slot-08"));
     assert!(contains(&out, b"BEGIN-8") && contains(&out, b"END-8"));
-    for (key, selected) in [('о', "slot-07"), ('л', "slot-08")] {
+    for (key, selected) in [("о", "slot-07"), ("\x1b[A", "slot-08")] {
         for byte in key.to_string().as_bytes() {
             c.master.write_all(&[*byte]).unwrap();
             sleep(Duration::from_millis(10));
@@ -869,7 +911,7 @@ fn picker_recency_selection_english_russian_navigation_and_fragmented_keys() {
     assert!(screen.row(10).contains("> slot-00"));
     assert!(screen.row(3).contains("slot-07"));
     assert!(!screen.rows().iter().any(|row| row.contains("slot-09")));
-    c.master.write_all(b"k").unwrap();
+    c.master.write_all(b"\x1b[A").unwrap();
     let out = c.read_until(b"scroll");
     screen.feed(&out);
     assert!(screen.row(9).contains("> slot-01"));
@@ -1279,6 +1321,8 @@ fn picker_failed_creation_retains_name_cursor_then_recovers_or_handles_resize_an
             .write_all(b"edited-name\x1b[D\x1b[D\x1b[D\r")
             .unwrap();
         let out = c.read_until(b"scroll");
+        picker_reporting_restored(&out);
+        picker_reporting_enabled(&out);
         assert!(contains(&out, b"Cannot open session:"));
         assert!(contains(&out, b"New: edited-name"));
         c.master.write_all(b"X").unwrap();
@@ -1592,18 +1636,53 @@ fn picker_standard_keys_create_edit_and_cancel_names_without_management() {
 #[test]
 fn picker_exit_keys_signal_and_resize_restore_terminal() {
     let s = Sessions::new();
-    for key in [3, 4, 28] {
+    for key in [
+        &b"\x03"[..],
+        &b"\x04"[..],
+        &b"\x1c"[..],
+        &b"\x1b[99;5u"[..],
+        &b"\x1b[100;5u"[..],
+        &b"\x1b[92;5u"[..],
+        &b"\x1b[27;5;99~"[..],
+        &b"\x1b[27;5;100~"[..],
+        &b"\x1b[27;5;92~"[..],
+        &b"\x1b[1089::99;69u"[..],
+        &b"\x1b[1074::100;133u"[..],
+        &b"\x1b[52;5u"[..],
+        &b"\x1b[27;5;52~"[..],
+        &b"\x1b[124;6u"[..],
+        &b"\x1b[27;6;124~"[..],
+        &b"\x1b[27u"[..],
+    ] {
         let mut c = s.attach(&["pick"]);
-        c.read_until(b"scroll");
-        c.master.write_all(&[key]).unwrap();
-        c.read_until(b"\x1b[?1049l");
+        picker_reporting_enabled(&c.read_until(b"scroll"));
+        c.master.write_all(key).unwrap();
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
+        assert!(c.child.wait().success());
+        c.restored();
+    }
+    for (detach, key) in [
+        ("^]", "\x1b[93;5u"),
+        ("^@", "\x1b[32;5u"),
+        ("^?", "\x1b[63;5u"),
+        ("^I", "\x1b[105;5u"),
+        ("^K", "\x1b[107;5u"),
+        ("^]", "\x1b[27;5;93~"),
+        ("^@", "\x1b[27;5;32~"),
+        ("^?", "\x1b[27;5;63~"),
+        ("^I", "\x1b[27;5;105~"),
+    ] {
+        let mut c = s.attach(&["-e", detach, "pick"]);
+        picker_reporting_enabled(&c.read_until(b"scroll"));
+        c.master.write_all(key.as_bytes()).unwrap();
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
         assert!(c.child.wait().success());
         c.restored();
     }
     let mut c = s.attach(&["-e", "^I", "pick"]);
     c.read_until(b"scroll");
     c.master.write_all(b"\t").unwrap();
-    c.read_until(b"\x1b[?1049l");
+    picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
     assert!(c.child.wait().success());
     c.restored();
     let mut c = s.attach(&["pick"]);
@@ -1647,9 +1726,42 @@ fn picker_exit_keys_signal_and_resize_restore_terminal() {
                 .unwrap()
                 .success()
         );
-        c.read_until(b"\x1b[?1049l");
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
         assert!(c.child.wait().success());
         c.restored();
+    }
+}
+
+#[test]
+fn picker_restores_first_reported_xterm_mode_before_exit_and_attach() {
+    let s = Sessions::new();
+    s.ok(&["start", "live", "sh", "-c", "printf MODE_READY; cat"]);
+    wait_for(|| contains(&s.log("live"), b"MODE_READY"));
+    for mode in [-1, 0, 1, 2, 3] {
+        let restore = if mode == -1 {
+            "\x1b[>4n".to_owned()
+        } else {
+            format!("\x1b[>4;{mode}m")
+        };
+        for attach in [false, true] {
+            let mut c = s.attach(&["pick"]);
+            picker_reporting_enabled(&c.read_until(b"scroll"));
+            let mut input = format!("\x1b[>4;999m\x1b[>4;{mode}m\x1b[>4;2m").into_bytes();
+            input.push(if attach { b'\r' } else { 3 });
+            c.master.write_all(&input).unwrap();
+            let output = c.read_until(if attach {
+                b"MODE_READY"
+            } else {
+                b"\x1b[?1049l"
+            });
+            picker_reporting_restored_to(&output, restore.as_bytes());
+            if attach {
+                c.detach();
+            } else {
+                assert!(c.child.wait().success());
+            }
+            c.restored();
+        }
     }
 }
 
@@ -1802,6 +1914,7 @@ fn picker_all_states_and_live_attach() {
     let pid = fs::read(&pid_file).unwrap();
     let mut c = s.attach(&["pick"]);
     let out = c.read_until(b"scroll");
+    picker_reporting_enabled(&out);
     let mut screen = screen::Screen::new(80, 24);
     screen.feed(&out);
     assert!(screen.row(3).contains("> live") && screen.row(3).contains("[running]"));
@@ -1818,7 +1931,7 @@ fn picker_all_states_and_live_attach() {
             .any(|row| row.contains("stale") && row.contains("[stale]"))
     );
     c.master.write_all(b"\r").unwrap();
-    c.read_until(b"LIVE_READY");
+    picker_reporting_restored(&c.read_until(b"LIVE_READY"));
     c.master.write_all(b"picker-input\n").unwrap();
     c.read_until(b"LIVE_picker-input");
     assert_eq!(fs::read(&pid_file).unwrap(), pid);
@@ -1995,6 +2108,406 @@ fn picker_live_delete_refusal_and_clear_preserve_process_and_attachment() {
 }
 
 #[test]
+fn picker_upward_navigation_and_ambiguous_keys_preserve_live_sessions_in_every_pane() {
+    use std::fmt::Write as _;
+    let s = Sessions::new();
+    s.ok(&["start", "other", "sh", "-c", "printf OTHER_READY; cat"]);
+    wait_for(|| contains(&s.log("other"), b"OTHER_READY"));
+    let mut history = String::new();
+    for i in 0..60 {
+        writeln!(history, "line-{i:02}").unwrap();
+    }
+    s.ok(&[
+        "start",
+        "live",
+        "sh",
+        "-c",
+        "printf '%s' \"$1\"; cat",
+        "sh",
+        &history,
+    ]);
+    wait_for(|| contains(&s.log("live"), b"line-59"));
+    let saved = s.log("live");
+    for (prepare, position) in [
+        ("j", "Sessions (1/2)"),
+        ("\tj", "Beginning (1/60)"),
+        ("\t\t\x1b[Hj", "Ending (1/60)"),
+    ] {
+        for key in ["k", "л"] {
+            let mut c = s.attach(&["pick"]);
+            picker_reporting_enabled(&c.read_until(b"scroll"));
+            c.master.write_all(prepare.as_bytes()).unwrap();
+            c.read_until(b"scroll");
+            c.master.write_all(key.as_bytes()).unwrap();
+            let output = c.read_until(b"scroll");
+            assert!(contains(&output, position.as_bytes()), "{}", text(&output));
+            assert!(!contains(&output, b"Session stopped"));
+            c.master
+                .write_all(b"K\x0b\x1b[107;5u\x1b[107;6:3u\x1b[27;2;75~")
+                .unwrap();
+            let output = c.read_until(b"scroll");
+            assert!(!contains(&output, b"Session stopped"));
+            assert_eq!(s.log("live"), saved);
+            assert_eq!(text(&s.ok(&["list"])).matches("[running]").count(), 2);
+            c.master.write_all(b"n").unwrap();
+            let output = c.read_until(b"scroll");
+            assert!(contains(&output, b"New: session-1"));
+            for kill in [b"\x1b[107;6u".as_slice(), b"\x1b[27;6;75~".as_slice()] {
+                c.master.write_all(kill).unwrap();
+                let output = c.read_until(b"scroll");
+                assert!(contains(&output, b"New: session-1"));
+                assert!(!contains(&output, b"Session stopped"));
+                assert!(!s.sessions.join("live.ended").exists());
+                assert_eq!(text(&s.ok(&["list"])).matches("[running]").count(), 2);
+            }
+            c.master.write_all(b"\x1b[91;5uq").unwrap();
+            picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
+            assert!(c.child.wait().success());
+            c.restored();
+        }
+    }
+    s.push("live", b"STILL_ALIVE\n");
+    wait_for(|| contains(&s.log("live"), b"STILL_ALIVE"));
+}
+
+#[test]
+fn picker_enhanced_backtab_preserves_focus_and_reporting() {
+    let s = Sessions::new();
+    for key in ["\x1b[9;2u", "\x1b[27;2;9~"] {
+        let mut c = s.attach(&["pick"]);
+        picker_reporting_enabled(&c.read_until(b"scroll"));
+        c.master.write_all(b"\t\t").unwrap();
+        assert!(contains(&c.read_until(b"scroll"), "● Ending".as_bytes()));
+        c.master.write_all(key.as_bytes()).unwrap();
+        assert!(contains(&c.read_until(b"scroll"), "● Beginning".as_bytes()));
+        c.master.write_all(b"\x1b[27u").unwrap();
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
+        assert!(c.child.wait().success());
+        c.restored();
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn picker_force_stop_terminates_all_jobs_preserves_other_session_and_then_deletes() {
+    for (attached, key, focus) in [
+        (false, "\x1b[107;6u", ""),
+        (false, "\x1b[27;6;75~", "\t"),
+        (false, "\x1b[1083;6u", "\t\t"),
+        (true, "\x1b[27;6;107~", ""),
+        (true, "\x1b[1051;6u", "\t"),
+        (true, "\x1b[27;6;1083~", "\t\t"),
+    ] {
+        let mut s = Sessions::new();
+        s.ok(&[
+            "start", "other", "sh", "-c",
+            "printf 'OTHER_READY\n'; while IFS= read -r line; do printf 'OTHER_%s\n' \"$line\"; done",
+        ]);
+        wait_for(|| contains(&s.log("other"), b"OTHER_READY"));
+        let files = ["shell.pid", "background.pid", "foreground.pid"].map(|name| s.root.join(name));
+        s.ok(&[
+            "start", "selected", "bash", "--noprofile", "--norc", "-c",
+            r#"set -m; trap '' HUP TERM; printf '%s' "$$" > "$1"; sh -c 'trap "" HUP TERM; printf "%s" "$$" > "$1"; exec sleep 60' sh "$2" & sh -c 'trap "" HUP TERM; printf "%s" "$$" > "$1"; printf "STOP_READY\n"; exec sleep 60' sh "$3"; wait"#,
+            "bash", files[0].to_str().unwrap(), files[1].to_str().unwrap(), files[2].to_str().unwrap(),
+        ]);
+        wait_for(|| {
+            files
+                .iter()
+                .all(|path| fs::metadata(path).is_ok_and(|m| m.len() > 0))
+        });
+        wait_for(|| contains(&s.log("selected"), b"STOP_READY"));
+        let jobs = files.map(|path| fs::read_to_string(path).unwrap().parse::<i32>().unwrap());
+        let groups = jobs.map(|pid| {
+            let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let fields = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(fields[3].parse::<i32>().unwrap(), jobs[0]);
+            fields[2].parse::<i32>().unwrap()
+        });
+        assert_ne!(groups[0], groups[1]);
+        assert_ne!(groups[0], groups[2]);
+        assert_ne!(groups[1], groups[2]);
+        s.track_jobs("selected");
+        let history = s.log("selected");
+        let head = decoded(s.sessions.join("selected.head"));
+        let mut live = attached.then(|| {
+            let mut client = s.attach(&["attach", "selected"]);
+            client.read_until(b"STOP_READY");
+            client
+        });
+        let mut picker = s.attach(&["pick"]);
+        let mut screen = screen::Screen::new(80, 24);
+        screen.feed(&picker.read_until(b"scroll"));
+        assert!(screen.row(3).contains("> selected"));
+        picker
+            .master
+            .write_all("\x1b[200~kл\x1b[107;6u\x1b[27;6;75~\x1b[201~".as_bytes())
+            .unwrap();
+        picker.read_until(b"scroll");
+        assert!(s.sessions.join("selected").exists());
+        for pid in jobs {
+            assert!(fs::read_to_string(format!("/proc/{pid}/stat")).is_ok());
+        }
+        picker
+            .master
+            .write_all(format!("{focus}{key}").as_bytes())
+            .unwrap();
+        let out = picker.read_until(b"Session stopped");
+        screen.feed(&out);
+        // Drain the rest of this frame before the next management key.
+        if !contains(&out, b"scroll") {
+            screen.feed(&picker.read_until(b"scroll"));
+        }
+        s.ended("selected");
+        wait_for(|| {
+            jobs.iter().all(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                    matches!(
+                        stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                        Some("Z" | "X")
+                    )
+                })
+            })
+        });
+        assert!(
+            screen
+                .rows()
+                .iter()
+                .any(|row| row.contains("> selected") && row.contains("[ended]"))
+        );
+        if !focus.is_empty() {
+            assert!(
+                screen
+                    .rows()
+                    .iter()
+                    .any(|row| row.contains(if focus == "\t" {
+                        "● Beginning"
+                    } else {
+                        "● Ending"
+                    }))
+            );
+        }
+        assert!(s.log("selected").starts_with(&history));
+        assert!(decoded(s.sessions.join("selected.head")).starts_with(&head));
+        assert!(picker.child.0.try_wait().unwrap().is_none());
+        if let Some(client) = &mut live {
+            assert!(client.child.wait().success());
+            client.restored();
+        }
+        s.push("other", b"after-stop\n");
+        wait_for(|| contains(&s.log("other"), b"OTHER_after-stop"));
+        picker.master.write_all(b"\x1b[3~").unwrap();
+        picker.read_until(b"Session deleted");
+        for suffix in ["", ".log", ".head", ".ended"] {
+            assert!(!s.sessions.join(format!("selected{suffix}")).exists());
+        }
+        assert!(picker.child.0.try_wait().unwrap().is_none());
+        picker.detach();
+        picker.restored();
+    }
+}
+
+#[test]
+fn picker_force_stop_offline_missing_empty_and_printable_detach_preserve_sessions() {
+    for state in ["ended", "stale", "missing"] {
+        let s = Sessions::new();
+        s.ok(&["start", "saved", "printf", "RETAINED"]);
+        s.ended("saved");
+        if state == "stale" {
+            drop(UnixListener::bind(s.sessions.join("saved")).unwrap());
+        }
+        let history = s.log("saved");
+        let head = decoded(s.sessions.join("saved.head"));
+        let marker = fs::read(s.sessions.join("saved.ended")).unwrap();
+        let mut picker = s.attach(&["pick"]);
+        picker.read_until(b"scroll");
+        if state == "missing" {
+            s.ok(&["rm", "saved"]);
+        }
+        picker.master.write_all(b"\x1b[1083;6u").unwrap();
+        let out = picker.read_until(b"scroll");
+        assert!(contains(
+            &out,
+            if state == "missing" {
+                b"Session is missing"
+            } else {
+                b"already stopped"
+            }
+        ));
+        if state == "missing" {
+            assert!(contains(&out, b"No sessions"));
+            picker.master.write_all(b"\x1b[107;6u").unwrap();
+            let out = picker.read_until(b"scroll");
+            assert!(!contains(&out, b"Session stopped"));
+        } else {
+            assert_eq!(s.log("saved"), history);
+            assert_eq!(decoded(s.sessions.join("saved.head")), head);
+            assert_eq!(fs::read(s.sessions.join("saved.ended")).unwrap(), marker);
+            assert_eq!(s.sessions.join("saved").exists(), state == "stale");
+        }
+        picker.detach();
+        picker.restored();
+    }
+    let s = Sessions::new();
+    s.ok(&["start", "live", "sh", "-c", "printf LIVE_READY; cat"]);
+    wait_for(|| contains(&s.log("live"), b"LIVE_READY"));
+    let mut picker = s.attach(&["-e", "k", "pick"]);
+    picker.read_until(b"scroll");
+    picker.master.write_all(b"\x1b[200~k\x1b[201~").unwrap();
+    picker.read_until(b"scroll");
+    assert!(picker.child.0.try_wait().unwrap().is_none());
+    picker.master.write_all(b"k").unwrap();
+    assert!(picker.child.wait().success());
+    picker.restored();
+    assert!(s.sessions.join("live").exists());
+    assert!(contains(&s.ok(&["list"]), b"[running]"));
+}
+
+#[test]
+fn picker_force_stop_refuses_unidentified_peer_without_signaling_or_exiting() {
+    let s = Sessions::new();
+    let listener = UnixListener::bind(s.sessions.join("unidentified")).unwrap();
+    let mut picker = s.attach(&["pick"]);
+    picker.read_until(b"scroll");
+    picker.master.write_all(b"\x1b[107;6u").unwrap();
+    let out = picker.read_until(b"scroll");
+    assert!(contains(&out, b"Cannot stop"));
+    assert!(s.sessions.join("unidentified").exists());
+    assert!(picker.child.0.try_wait().unwrap().is_none());
+    picker.detach();
+    picker.restored();
+    drop(listener);
+    fs::remove_file(s.sessions.join("unidentified")).unwrap();
+}
+
+#[test]
+#[allow(unsafe_code)]
+fn captured_session_cleanup_preserves_a_process_that_calls_setsid_after_snapshot() {
+    use std::os::fd::FromRawFd;
+
+    struct Escaped(File);
+    impl Drop for Escaped {
+        fn drop(&mut self) {
+            // SAFETY: this owned pidfd identifies only the private escaped job,
+            // even if its numeric PID exits and gets reused during cleanup.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.0.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+        }
+    }
+    let mut s = Sessions::new();
+    let files = [
+        "shell.pid",
+        "before.pid",
+        "escape.go",
+        "after.pid",
+        "original.pid",
+    ]
+    .map(|name| s.root.join(name));
+    s.ok(&[
+        "start", "scope", "sh", "-c",
+        r#"trap '' HUP TERM; printf '%s' "$$" > "$1"; sh -c "$6" sh "$2" "$3" "$4" & sh -c 'trap "" HUP TERM; printf "%s" "$$" > "$1"; exec sleep 60' sh "$5" & wait"#,
+        "sh", files[0].to_str().unwrap(), files[1].to_str().unwrap(), files[2].to_str().unwrap(), files[3].to_str().unwrap(), files[4].to_str().unwrap(),
+        r#"trap '' HUP TERM; printf '%s' "$$" > "$1"; while [ ! -e "$2" ]; do sleep 0.02; done; exec setsid sh -c 'printf "%s" "$$" > "$1"; exec sleep 60' sh "$3""#,
+    ]);
+    wait_for(|| {
+        [0, 1, 4]
+            .iter()
+            .all(|&i| fs::metadata(&files[i]).is_ok_and(|m| m.len() > 0))
+    });
+    let pid = |i: usize| {
+        fs::read_to_string(&files[i])
+            .unwrap()
+            .parse::<i32>()
+            .unwrap()
+    };
+    let original = [pid(0), pid(4)];
+    let escaped_pid = pid(1);
+    let socket = UnixStream::connect(s.sessions.join("scope")).unwrap();
+    let snapshot = os::ChildSession::identify(&socket).unwrap();
+    s.track_jobs("scope");
+    // SAFETY: escaped_pid is a positive PID read from this private fixture.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, escaped_pid, 0) };
+    assert!(descriptor >= 0);
+    // SAFETY: pidfd_open returned a new descriptor with unique ownership.
+    let escaped = Escaped(unsafe { File::from_raw_fd(i32::try_from(descriptor).unwrap()) });
+    fs::write(&files[2], b"go").unwrap();
+    wait_for(|| fs::metadata(&files[3]).is_ok_and(|m| m.len() > 0));
+    assert_eq!(pid(3), escaped_pid, "setsid must run in the captured PID");
+    // SAFETY: getsid only inspects the positive private fixture PID.
+    assert_eq!(unsafe { libc::getsid(escaped_pid) }, escaped_pid);
+    snapshot.kill().unwrap();
+    wait_for(|| {
+        original.iter().all(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                matches!(
+                    stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+                    Some("Z" | "X")
+                )
+            })
+        })
+    });
+    s.ended("scope");
+    let stat = fs::read_to_string(format!("/proc/{escaped_pid}/stat")).unwrap();
+    assert!(!matches!(
+        stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+        Some("Z" | "X")
+    ));
+    drop(escaped);
+}
+
+#[test]
+fn picker_force_stop_updates_local_row_and_scroll_when_refresh_fails() {
+    use std::fmt::Write as _;
+    let s = Sessions::new();
+    let mut history = String::new();
+    for i in 0..60 {
+        writeln!(history, "line-{i:02}").unwrap();
+    }
+    s.ok(&[
+        "start",
+        "selected",
+        "sh",
+        "-c",
+        "printf '%s' \"$1\"; cat",
+        "sh",
+        &history,
+    ]);
+    wait_for(|| contains(&s.log("selected"), b"line-59"));
+    let saved = s.log("selected");
+    let mut picker = s.attach(&["pick"]);
+    picker.read_until(b"scroll");
+    picker.master.write_all(b"\t\x1b[6~").unwrap();
+    assert!(contains(
+        &picker.read_until(b"scroll"),
+        b"Beginning (13/60)"
+    ));
+    fs::write(s.sessions.join("broken"), b"not a socket").unwrap();
+    fs::write(s.sessions.join("broken.log"), b"UNRELATED").unwrap();
+    picker.master.write_all(b"\x1b[107;6u").unwrap();
+    let out = picker.read_until(b"scroll");
+    assert!(contains(&out, b"Session stopped"));
+    assert!(contains(&out, b"Cannot refresh sessions"));
+    assert!(contains(&out, b"Beginning (13/60)") && contains(&out, "● Beginning".as_bytes()));
+    let mut screen = screen::Screen::new(80, 24);
+    screen.feed(&out);
+    assert!(screen.row(3).contains("> selected") && screen.row(3).contains("[ended]"));
+    assert_eq!(s.log("selected"), saved);
+    picker.detach();
+    picker.restored();
+}
+
+#[test]
 fn picker_offline_clear_preserves_identity_marker_and_stale_socket() {
     for (stale, clear) in [
         (false, "c"),
@@ -2108,12 +2621,20 @@ fn picker_busy_directory_keeps_files_and_allows_exit_signal_and_retry() {
     for (action, clean) in [
         ("c", true),
         ("d", false),
+        ("\x1b[107;6u", false),
+        ("\x1b[27;6;75~", false),
         ("\x1bOQ", true),
         ("\x1b[3~", false),
     ] {
         let s = Sessions::new();
-        s.ok(&["start", "locked", "printf", "LOCKED_HISTORY"]);
-        s.ended("locked");
+        let stop = matches!(action, "\x1b[107;6u" | "\x1b[27;6;75~");
+        if stop {
+            s.ok(&["start", "locked", "sh", "-c", "printf LOCKED_HISTORY; cat"]);
+            wait_for(|| s.log("locked") == b"LOCKED_HISTORY");
+        } else {
+            s.ok(&["start", "locked", "printf", "LOCKED_HISTORY"]);
+            s.ended("locked");
+        }
         let mut c = s.attach(&["pick"]);
         c.read_until(b"scroll");
         let directory = File::open(&s.sessions).unwrap();
@@ -2122,7 +2643,7 @@ fn picker_busy_directory_keeps_files_and_allows_exit_signal_and_retry() {
         let out = c.read_until(b"scroll");
         assert!(contains(&out, b"directory is busy; retry"));
         assert_eq!(s.log("locked"), b"LOCKED_HISTORY");
-        assert!(s.sessions.join("locked.ended").exists());
+        assert_eq!(s.sessions.join("locked.ended").exists(), !stop);
         c.master.write_all(b"q").unwrap();
         c.read_until(b"\x1b[?1049l");
         assert!(c.child.wait().success());
@@ -2150,7 +2671,9 @@ fn picker_busy_directory_keeps_files_and_allows_exit_signal_and_retry() {
         drop(directory);
         assert_eq!(s.log("locked"), b"LOCKED_HISTORY");
         c.master.write_all(action.as_bytes()).unwrap();
-        c.read_until(if clean {
+        c.read_until(if stop {
+            b"Session stopped"
+        } else if clean {
             b"Logs cleaned"
         } else {
             b"Session deleted"
@@ -2239,7 +2762,7 @@ fn picker_successful_delete_selects_local_neighbour_when_rescan_fails() {
 }
 
 #[test]
-fn picker_hidden_selection_requires_resize_before_delete_or_clean() {
+fn picker_hidden_selection_requires_resize_before_stop_delete_or_clean() {
     let s = Sessions::new();
     s.ok(&["start", "hidden", "printf", "PRESERVED_HISTORY"]);
     s.ended("hidden");
@@ -2261,7 +2784,17 @@ fn picker_hidden_selection_requires_resize_before_delete_or_clean() {
         .unwrap();
         signal_child(&c.child.0, "-WINCH");
         c.read_until(if width == 20 { b"Esc exit" } else { b"scroll" });
-        for action in ["d", "c", "в", "с", "\x1b[3~", "\x1bOQ", "\x1b[12~"] {
+        for action in [
+            "d",
+            "c",
+            "\x1b[107;6u",
+            "в",
+            "с",
+            "\x1b[27;6;75~",
+            "\x1b[3~",
+            "\x1bOQ",
+            "\x1b[12~",
+        ] {
             c.master.write_all(action.as_bytes()).unwrap();
             let out = c.read_until(if width == 20 { b"Esc exit" } else { b"scroll" });
             assert!(contains(&out, b"Resize before"));
@@ -2395,7 +2928,27 @@ fn picker_control_exit_bytes_still_restore_terminal_inside_bracketed_paste() {
         let mut bytes = "\x1b[200~jkhlqdcnолрдйвст".as_bytes().to_vec();
         bytes.push(key);
         c.master.write_all(&bytes).unwrap();
-        c.read_until(b"\x1b[?1049l");
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
+        assert!(c.child.wait().success());
+        c.restored();
+    }
+    for (detach, key) in [
+        ("^\\", "\x1b[99;5u"),
+        ("^\\", "\x1b[100;133u"),
+        ("^\\", "\x1b[92;5u"),
+        ("^]", "\x1b[93;5u"),
+        ("^\\", "\x1b[27;5;99~"),
+        ("^\\", "\x1b[27;5;100~"),
+        ("^\\", "\x1b[27;5;92~"),
+        ("^]", "\x1b[27;5;93~"),
+    ] {
+        let mut c = s.attach(&["-e", detach, "pick"]);
+        c.read_until(b"scroll");
+        c.master.write_all(b"\x1b[200~pasted").unwrap();
+        for byte in key.as_bytes() {
+            c.master.write_all(&[*byte]).unwrap();
+        }
+        picker_reporting_restored(&c.read_until(b"\x1b[?1049l"));
         assert!(c.child.wait().success());
         c.restored();
     }
@@ -2445,7 +2998,7 @@ fn picker_selection_resets_scrolled_previews_and_reports_empty_missing_history()
     c.master.write_all(b"\t\x1b[6~").unwrap();
     let out = c.read_until(b"scroll");
     assert!(contains(&out, b"beta-line-12"));
-    for (down, up) in [("j", "k"), ("о", "л")] {
+    for (down, up) in [("j", "\x1b[A"), ("о", "\x1b[A")] {
         c.master.write_all(down.as_bytes()).unwrap();
         let out = c.read_until(b"scroll");
         assert!(contains(&out, b"Beginning (14/60)"));
@@ -2456,7 +3009,7 @@ fn picker_selection_resets_scrolled_previews_and_reports_empty_missing_history()
     }
     c.master.write_all(b"\t\x1b[H").unwrap();
     c.read_until(b"scroll");
-    for (down, up) in [("j", "k"), ("о", "л")] {
+    for (down, up) in [("j", "\x1b[A"), ("о", "\x1b[A")] {
         c.master.write_all(down.as_bytes()).unwrap();
         let out = c.read_until(b"scroll");
         assert!(contains(&out, b"Ending (2/60)"));

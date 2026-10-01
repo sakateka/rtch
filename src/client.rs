@@ -312,19 +312,40 @@ pub fn control(path: &Path, kind: u8, force: bool) -> Result<()> {
         p[1] = 1;
     }
     s.write_all(&p)?;
+    control_ack(&mut s)?;
+    if kind == server::KILL {
+        wait_stopped(path)?;
+    }
+    Ok(())
+}
+pub fn force_stop(path: &Path) -> Result<()> {
+    let mut socket = storage::connect(path)?;
+    socket.set_read_timeout(Some(Duration::from_secs(8)))?;
+    socket.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let session = os::ChildSession::identify(&socket)?;
+    let mut packet = server::packet(server::KILL, &[]);
+    packet[1] = 1;
+    socket.write_all(&packet)?;
+    let acknowledgment = control_ack(&mut socket);
+    session.kill()?;
+    acknowledgment?;
+    wait_stopped(path)
+}
+fn control_ack(s: &mut UnixStream) -> Result<()> {
     let mut ack = [0; 2];
     s.read_exact(&mut ack)?;
     if &ack != b"OK" {
         return fail("unexpected response from supervisor");
     }
-    if kind == server::KILL {
-        let start = Instant::now();
-        while matches!(storage::state(path)?, State::Running | State::Attached) {
-            if start.elapsed() > Duration::from_secs(8) {
-                return fail("session did not stop");
-            }
-            std::thread::sleep(Duration::from_millis(50));
+    Ok(())
+}
+fn wait_stopped(path: &Path) -> Result<()> {
+    let start = Instant::now();
+    while matches!(storage::state(path)?, State::Running | State::Attached) {
+        if start.elapsed() > Duration::from_secs(8) {
+            return fail("session did not stop");
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
     Ok(())
 }

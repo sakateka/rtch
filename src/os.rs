@@ -266,6 +266,11 @@ pub fn suspend() {
 }
 pub fn validate_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
     #[cfg(target_os = "linux")]
+    peer_pid(stream)?;
+    Ok(())
+}
+pub fn peer_pid(stream: &std::os::unix::net::UnixStream) -> io::Result<i32> {
+    #[cfg(target_os = "linux")]
     {
         let mut cred = MaybeUninit::<libc::ucred>::uninit();
         let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::ucred>())
@@ -285,15 +290,230 @@ pub fn validate_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> 
             if len as usize != std::mem::size_of::<libc::ucred>() {
                 return Err(io::Error::other("invalid peer credentials length"));
             }
-            if cred.assume_init().uid != uid() {
+            let cred = cred.assume_init();
+            if cred.uid != uid() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "session belongs to another user",
                 ));
             }
+            Ok(cred.pid)
         }
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "session process identification requires Linux",
+    ))
+}
+
+#[derive(Debug)]
+struct ProcessInfo {
+    parent: i32,
+    session: i32,
+    started: u64,
+    alive: bool,
+}
+fn process_info(pid: i32) -> io::Result<ProcessInfo> {
+    parse_process_info(&std::fs::read(format!("/proc/{pid}/stat"))?)
+}
+fn parse_process_info(stat: &[u8]) -> io::Result<ProcessInfo> {
+    // comm can contain arbitrary bytes, spaces and parentheses. Only the
+    // guaranteed ASCII fields after its final ')' are interpreted as text.
+    let end = stat
+        .iter()
+        .rposition(|&byte| byte == b')')
+        .ok_or_else(|| io::Error::other("invalid process status"))?;
+    let fields = std::str::from_utf8(&stat[end + 1..])
+        .map_err(io::Error::other)?
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let number = |index: usize| {
+        fields
+            .get(index)
+            .ok_or_else(|| io::Error::other("incomplete process status"))?
+            .parse::<i32>()
+            .map_err(io::Error::other)
+    };
+    Ok(ProcessInfo {
+        parent: number(1)?,
+        session: number(3)?,
+        started: fields
+            .get(19)
+            .ok_or_else(|| io::Error::other("incomplete process status"))?
+            .parse()
+            .map_err(io::Error::other)?,
+        alive: !matches!(fields.first(), Some(&"Z" | &"X")),
+    })
+}
+fn exited(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+struct SessionProcess {
+    pid: i32,
+    started: u64,
+    descriptor: File,
+}
+pub struct ChildSession {
+    id: i32,
+    started: u64,
+    members: Vec<SessionProcess>,
+}
+impl ChildSession {
+    pub fn identify(stream: &std::os::unix::net::UnixStream) -> io::Result<Self> {
+        let supervisor = peer_pid(stream)?;
+        let children =
+            std::fs::read_to_string(format!("/proc/{supervisor}/task/{supervisor}/children"))?;
+        let mut session = None;
+        for child in children.split_whitespace() {
+            let pid: i32 = child.parse().map_err(io::Error::other)?;
+            let info = match process_info(pid) {
+                Ok(info) => info,
+                Err(error) if exited(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if pid > 1 && info.parent == supervisor && info.session == pid && info.alive {
+                if session.is_some() {
+                    return Err(io::Error::other("ambiguous supervisor child session"));
+                }
+                session = Some(Self {
+                    id: pid,
+                    started: info.started,
+                    members: Vec::new(),
+                });
+            }
+        }
+        let mut session =
+            session.ok_or_else(|| io::Error::other("supervisor child session is missing"))?;
+        // Capture identities before KILL lets an older supervisor reap its child.
+        session.members = session.members()?;
+        if !session
+            .members
+            .iter()
+            .any(|member| member.pid == session.id)
+        {
+            return Err(io::Error::other("supervisor child session has ended"));
+        }
+        Ok(session)
+    }
+    fn members(&self) -> io::Result<Vec<SessionProcess>> {
+        let mut members = Vec::new();
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+                .filter(|pid| *pid > 1)
+            else {
+                continue;
+            };
+            // SAFETY: getsid only inspects this positive PID. Checking SID
+            // first avoids opening inaccessible stat files of unrelated users.
+            let session = unsafe { libc::getsid(pid) };
+            if session < 0 {
+                let error = io::Error::last_os_error();
+                if exited(&error) {
+                    continue;
+                }
+                return Err(error);
+            }
+            if session != self.id {
+                continue;
+            }
+            let info = match process_info(pid) {
+                Ok(info) => info,
+                Err(error) if exited(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if info.session != self.id || !info.alive {
+                continue;
+            }
+            // SAFETY: pid is positive; pidfd_open takes no pointer arguments.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                if exited(&error) {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: pidfd_open returned a new owned descriptor.
+            let descriptor =
+                unsafe { File::from_raw_fd(i32::try_from(fd).map_err(io::Error::other)?) };
+            let current = match process_info(pid) {
+                Ok(info) => info,
+                Err(error) if exited(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if current.started != info.started || current.session != self.id || !current.alive {
+                continue;
+            }
+            members.push(SessionProcess {
+                pid,
+                started: info.started,
+                descriptor,
+            });
+        }
+        Ok(members)
+    }
+    pub fn kill(mut self) -> io::Result<()> {
+        let start = std::time::Instant::now();
+        loop {
+            // A reused session-leader PID must never widen the selected scope.
+            match process_info(self.id) {
+                Ok(info) if info.started != self.started || info.session != self.id => {
+                    return Err(io::Error::other("session identity changed"));
+                }
+                Ok(_) => {}
+                Err(error) if exited(&error) => {}
+                Err(error) => return Err(error),
+            }
+            let mut failure = None;
+            for member in &self.members {
+                let info = match process_info(member.pid) {
+                    Ok(info) => info,
+                    Err(error) if exited(&error) => continue,
+                    Err(error) => {
+                        failure.get_or_insert(error);
+                        continue;
+                    }
+                };
+                if info.session != self.id || info.started != member.started || !info.alive {
+                    continue;
+                }
+                // SAFETY: the pidfd pins this process identity. The immediately
+                // preceding status read verifies membership in the selected SID.
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        member.descriptor.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                };
+                if result < 0 {
+                    let error = io::Error::last_os_error();
+                    if !exited(&error) {
+                        failure.get_or_insert(error);
+                    }
+                }
+            }
+            self.members.clear();
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            self.members = self.members()?;
+            if self.members.is_empty() {
+                return Ok(());
+            }
+            if start.elapsed() > std::time::Duration::from_secs(8) {
+                return Err(io::Error::other("session processes did not stop"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 pub fn null_stdio() -> io::Result<()> {
     let null = std::fs::OpenOptions::new()
@@ -323,5 +543,26 @@ pub fn set_flags(fd: RawFd, flags: i32) -> io::Result<()> {
         Err(io::Error::last_os_error())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_process_info;
+
+    #[test]
+    fn process_status_accepts_non_utf8_names_with_spaces_and_parentheses() {
+        for state in ['S', 'Z'] {
+            let mut stat = b"456 (raw\xff \xfe name)with)paren)".to_vec();
+            stat.extend_from_slice(
+                format!(" {state} 123 456 456 {} 789\n", ["0"; 15].join(" ")).as_bytes(),
+            );
+            assert!(std::str::from_utf8(&stat).is_err());
+            let info = parse_process_info(&stat).unwrap();
+            assert_eq!(info.parent, 123);
+            assert_eq!(info.session, 456);
+            assert_eq!(info.started, 789);
+            assert_eq!(info.alive, state == 'S');
+        }
     }
 }

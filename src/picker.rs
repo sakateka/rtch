@@ -69,6 +69,8 @@ enum Key {
     Insert,
     Delete,
     F2,
+    ForceStop,
+    XtermMode(i8),
     Char(char),
     Paste(char),
 }
@@ -78,6 +80,7 @@ struct Decoder {
     since: Option<Instant>,
     paste: bool,
     discard: bool,
+    control_detach: Option<u8>,
 }
 impl Decoder {
     fn feed(&mut self, bytes: &[u8]) -> Vec<Key> {
@@ -121,6 +124,27 @@ impl Decoder {
                     self.pending.clear();
                 }
                 return;
+            }
+            if self.pending.starts_with(b"\x1b[") {
+                let complete = self.pending.len() >= 3
+                    && self
+                        .pending
+                        .last()
+                        .is_some_and(|b| (0x40..=0x7e).contains(b));
+                if !complete && self.pending.len() < 32 {
+                    return;
+                }
+                if complete {
+                    let key = enhanced_key(&self.pending[2..]);
+                    if matches!(key, Some(Key::XtermMode(_)))
+                        || matches!(key, Some(Key::Char(c)) if matches!(c, '\u{3}' | '\u{4}')
+                            || c.is_ascii_control() && u8::try_from(u32::from(c)).ok() == self.control_detach)
+                    {
+                        keys.extend(key);
+                        self.pending.clear();
+                        return;
+                    }
+                }
             }
             let take = match std::str::from_utf8(&self.pending) {
                 Ok(text) => text.chars().next().expect("paste data").len_utf8(),
@@ -196,6 +220,7 @@ impl Decoder {
                     b"5~" => Some(Key::PageUp),
                     b"6~" => Some(Key::PageDown),
                     b"Z" => Some(Key::BackTab),
+                    _ if self.pending[1] == b'[' => enhanced_key(&self.pending[2..]),
                     _ => None,
                 },
             };
@@ -205,12 +230,7 @@ impl Decoder {
             match std::str::from_utf8(&self.pending) {
                 Ok(text) => {
                     let c = text.chars().next().expect("nonempty decoder");
-                    keys.push(match c {
-                        '\r' | '\n' => Key::Enter,
-                        '\t' => Key::Tab,
-                        '\u{7f}' | '\u{8}' => Key::Backspace,
-                        _ => Key::Char(c),
-                    });
+                    keys.push(plain_key(c));
                     self.pending.clear();
                 }
                 Err(e) if e.error_len().is_some() => {
@@ -232,6 +252,193 @@ impl Decoder {
             return Some(Key::Escape);
         }
         None
+    }
+}
+
+fn number(text: &str) -> Option<u32> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+fn modifiers(value: u32) -> Option<u32> {
+    Some(value.checked_sub(1)? & !(64 | 128))
+}
+
+fn locked_function_key(text: &str) -> Option<Key> {
+    let (last, body) = text.as_bytes().split_last()?;
+    let body = std::str::from_utf8(body).ok()?;
+    let mut fields = body.split(';');
+    let code = fields.next()?;
+    let modifier = match fields.next() {
+        Some(value) => {
+            let value = number(value)?;
+            // Only locks extend the existing management-key encodings.
+            if value.checked_sub(1)? & (64 | 128) == 0 || modifiers(value)? != 0 {
+                return None;
+            }
+            value
+        }
+        None if code == "1" && matches!(last, b'A' | b'B' | b'C' | b'D' | b'H' | b'F') => 1,
+        None => return None,
+    };
+    if fields.next().is_some() || modifiers(modifier)? != 0 {
+        return None;
+    }
+    match (code, last) {
+        ("1", b'A') => Some(Key::Up),
+        ("1", b'B') => Some(Key::Down),
+        ("1", b'C') => Some(Key::Right),
+        ("1", b'D') => Some(Key::Left),
+        ("1", b'H') | ("1" | "7", b'~') => Some(Key::Home),
+        ("1", b'F') | ("4" | "8", b'~') => Some(Key::End),
+        ("5", b'~') => Some(Key::PageUp),
+        ("6", b'~') => Some(Key::PageDown),
+        ("2", b'~') => Some(Key::Insert),
+        ("3", b'~') => Some(Key::Delete),
+        ("1", b'Q') | ("12", b'~') => Some(Key::F2),
+        _ => None,
+    }
+}
+
+fn keypad_key(codepoint: u32) -> Option<Key> {
+    // Kitty's functional-key table reserves U+E000..U+F8FF for keys.
+    match codepoint {
+        57399..=57408 => Some(Key::Char(char::from(
+            b'0' + u8::try_from(codepoint - 57399).ok()?,
+        ))),
+        57409 => Some(Key::Char('.')),
+        57410 => Some(Key::Char('/')),
+        57411 => Some(Key::Char('*')),
+        57412 => Some(Key::Char('-')),
+        57413 => Some(Key::Char('+')),
+        57414 => Some(Key::Enter),
+        57415 => Some(Key::Char('=')),
+        57416 => Some(Key::Char(',')),
+        57417 => Some(Key::Left),
+        57418 => Some(Key::Right),
+        57419 => Some(Key::Up),
+        57420 => Some(Key::Down),
+        57421 => Some(Key::PageUp),
+        57422 => Some(Key::PageDown),
+        57423 => Some(Key::Home),
+        57424 => Some(Key::End),
+        57425 => Some(Key::Insert),
+        57426 => Some(Key::Delete),
+        _ => None,
+    }
+}
+
+fn control_character(c: char) -> Option<char> {
+    match c.to_ascii_uppercase() {
+        ' ' | '2' | '@' | '`' => Some('\0'),
+        '3' | '[' | '{' => Some('\u{1b}'),
+        '4' | '\\' | '|' => Some('\u{1c}'),
+        '5' | ']' | '}' => Some('\u{1d}'),
+        '6' | '^' | '~' => Some('\u{1e}'),
+        '7' | '/' | '_' => Some('\u{1f}'),
+        '8' | '?' => Some('\u{7f}'),
+        c @ 'A'..='Z' => Some(char::from(c as u8 & 0x1f)),
+        c if c.is_ascii_control() => Some(c),
+        _ => None,
+    }
+}
+
+fn enhanced_key(sequence: &[u8]) -> Option<Key> {
+    let text = std::str::from_utf8(sequence).ok()?;
+    if let Some(mode) = text
+        .strip_prefix(">4;")
+        .and_then(|body| body.strip_suffix('m'))
+    {
+        return match mode {
+            "-1" => Some(Key::XtermMode(-1)),
+            _ => number(mode)
+                .filter(|value| *value <= 3)
+                .and_then(|value| i8::try_from(value).ok())
+                .map(Key::XtermMode),
+        };
+    }
+    if let Some(key) = locked_function_key(text) {
+        return Some(key);
+    }
+    let (codepoint, modifier, shifted, base) = if let Some(body) = text.strip_suffix('u') {
+        let mut fields = body.split(';');
+        let mut codes = fields.next()?.split(':');
+        let codepoint = number(codes.next()?)?;
+        let shifted_field = codes.next();
+        let shifted = match shifted_field {
+            Some("") | None => None,
+            Some(value) => Some(char::from_u32(number(value)?)?),
+        };
+        let base = match codes.next() {
+            Some(base) => Some(char::from_u32(number(base)?)?),
+            None => None,
+        };
+        if codes.next().is_some() || shifted_field == Some("") && base.is_none() {
+            return None;
+        }
+        let mut values = fields.next().unwrap_or("1").split(':');
+        let modifier = modifiers(number(values.next()?)?)?;
+        if let Some(event) = values.next()
+            && !matches!(number(event)?, 1 | 2)
+        {
+            return None;
+        }
+        if values.next().is_some()
+            || fields.next().is_some()
+            || shifted.is_some() && modifier & 1 == 0
+        {
+            return None;
+        }
+        (codepoint, modifier, shifted, base)
+    } else {
+        let body = text.strip_suffix('~')?;
+        let mut fields = body.split(';');
+        if fields.next()? != "27" {
+            return None;
+        }
+        let modifier = modifiers(number(fields.next()?)?)?;
+        let codepoint = number(fields.next()?)?;
+        if fields.next().is_some() {
+            return None;
+        }
+        (codepoint, modifier, None, None)
+    };
+    if (57344..=63743).contains(&codepoint) {
+        return (modifier == 0).then(|| keypad_key(codepoint)).flatten();
+    }
+    let c = char::from_u32(codepoint)?;
+    if modifier == 5 && (matches!(c, 'k' | 'K' | 'л' | 'Л') || base == Some('k')) {
+        return Some(Key::ForceStop);
+    }
+    match (c, modifier) {
+        ('\t', 1) => Some(Key::BackTab),
+        (_, 1) if c.is_ascii_control() => Some(plain_key(c)),
+        (_, 0) => Some(plain_key(c)),
+        (_, 1) if !c.is_control() => {
+            if let Some(shifted) = shifted {
+                if shifted.is_control() || (57344..=63743).contains(&u32::from(shifted)) {
+                    return None;
+                }
+                return Some(Key::Char(shifted));
+            }
+            let mut uppercase = c.to_uppercase();
+            let shifted = uppercase.next()?;
+            uppercase.next().is_none().then_some(Key::Char(shifted))
+        }
+        (_, 4 | 5) => control_character(base.unwrap_or(c)).map(Key::Char),
+        _ => None,
+    }
+}
+
+fn plain_key(c: char) -> Key {
+    match c {
+        '\u{1b}' => Key::Escape,
+        '\r' | '\n' => Key::Enter,
+        '\t' => Key::Tab,
+        '\u{7f}' | '\u{8}' => Key::Backspace,
+        _ => Key::Char(c),
     }
 }
 
@@ -449,6 +656,49 @@ impl Model {
         }
         self.message = message;
     }
+    fn force_stop(&mut self) {
+        let Some(entry) = self.entries.get(self.selected) else {
+            return;
+        };
+        let path = self.dir.join(&entry.name);
+        let lock = match storage::try_lock_parent(&path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                self.message = "Session directory is busy; retry stop.".into();
+                return;
+            }
+            Err(e) => {
+                self.message = format!("Cannot stop: {e}");
+                return;
+            }
+        };
+        let result = (|| match storage::state(&path)? {
+            storage::State::Running | storage::State::Attached => crate::client::force_stop(&path),
+            storage::State::Ended | storage::State::Stale => {
+                crate::fail("Session is already stopped; history is preserved.")
+            }
+            storage::State::Missing => crate::fail("Session is missing."),
+        })();
+        drop(lock);
+        let mut message = match result {
+            Ok(()) => "Session stopped; history preserved. Delete removes it.".into(),
+            Err(e) => format!("Cannot stop: {e}"),
+        };
+        if let Err(e) = self.refresh(false) {
+            if let Ok(state) = storage::state(&path)
+                && let Some(entry) = self.entries.get_mut(self.selected)
+            {
+                entry.state = state;
+            }
+            let offsets = self.offsets;
+            let columns = self.columns;
+            self.select();
+            self.offsets = offsets;
+            self.columns = columns;
+            message = format!("{message} Cannot refresh sessions: {e}");
+        }
+        self.message = message;
+    }
     fn clamp(&mut self, width: usize, layout: Layout) {
         let lines = [logical_lines(&self.beginning), logical_lines(&self.ending)];
         self.clamp_lines(width, layout, &lines);
@@ -515,6 +765,10 @@ impl Model {
             return Some(Choice::Exit);
         }
         let key = match key {
+            Key::Char(c) if c.is_ascii_control() => plain_key(c),
+            _ => key,
+        };
+        let key = match key {
             Key::Insert if self.naming.is_none() => Key::Char('n'),
             Key::Delete if self.naming.is_none() => Key::Char('d'),
             Key::F2 if self.naming.is_none() => Key::Char('c'),
@@ -541,11 +795,12 @@ impl Model {
         if self.naming.is_some() {
             return self.name_key(key);
         }
-        if matches!(key, Key::Char('d' | 'c'))
+        if matches!(key, Key::Char('d' | 'c') | Key::ForceStop)
             && self.entries.get(self.selected).is_some()
             && (width < 25 || layout.height < 20)
         {
-            self.message = "Resize before deleting or cleaning the selected session.".into();
+            self.message =
+                "Resize before stopping, deleting or cleaning the selected session.".into();
             return None;
         }
         match key {
@@ -554,6 +809,7 @@ impl Model {
             Key::Char('n') => self.create_name(),
             Key::Char('d') => self.manage(true),
             Key::Char('c') => self.manage(false),
+            Key::ForceStop => self.force_stop(),
             Key::Enter => {
                 if let Some(entry) = self.entries.get_mut(self.selected) {
                     let path = self.dir.join(&entry.name);
@@ -826,11 +1082,16 @@ fn action_hint(width: usize, height: usize) -> &'static str {
             _ => "Resize",
         }
     } else if height >= 20 && width >= 29 {
-        let full = "Enter opens · Insert new · Delete ended/stale · F2 clean logs";
+        let full =
+            "Enter opens · Insert new · Ctrl+Shift+K kill · Delete ended/stale · F2 clean logs";
         if display_width(full) <= width {
             full
+        } else if display_width("Enter Ins:new C-S-K:kill Del F2:clear") <= width {
+            "Enter Ins:new C-S-K:kill Del F2:clear"
+        } else if display_width("Enter Ins:new C-S-K:kill Del F2") <= width {
+            "Enter Ins:new C-S-K:kill Del F2"
         } else {
-            "Enter Ins:new Del F2:clear"
+            "Enter Ins:new ^⇧K:kill Del F2"
         }
     } else if display_width("Enter opens · Insert new") <= width {
         "Enter opens · Insert new"
@@ -1138,6 +1399,7 @@ struct Terminal {
     original: libc::termios,
     flags: i32,
     screen: bool,
+    xterm_mode: Option<i8>,
 }
 impl Terminal {
     fn enter() -> Result<Self> {
@@ -1145,11 +1407,12 @@ impl Terminal {
             original: os::term(0)?,
             flags: os::flags(1)?,
             screen: false,
+            xterm_mode: None,
         };
         os::nonblocking(1)?;
         os::set_term(0, &os::raw(guard.original), false)?;
         guard.screen = true;
-        Self::write(b"\x18\x1b\\\x1b[?1049h\x1b[r\x1b[?6l\x1b[?25l\x1b[?2004h\x1b[0m\x1b[2J")?;
+        Self::write(b"\x18\x1b\\\x1b[?1049h\x1b[>5u\x1b[?4m\x1b[>4;2m\x1b[r\x1b[?6l\x1b[?25l\x1b[?2004h\x1b[0m\x1b[2J")?;
         Ok(guard)
     }
     fn write(mut bytes: &[u8]) -> io::Result<()> {
@@ -1189,7 +1452,18 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if self.screen {
-            let _ = Self::write(b"\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l");
+            let mode: &[u8] = match self.xterm_mode {
+                Some(-1) => b"\x1b[>4n",
+                Some(0) => b"\x1b[>4;0m",
+                Some(1) => b"\x1b[>4;1m",
+                Some(2) => b"\x1b[>4;2m",
+                Some(3) => b"\x1b[>4;3m",
+                _ => b"\x1b[>4m",
+            };
+            let mut restore = b"\x1b[<u".to_vec();
+            restore.extend_from_slice(mode);
+            restore.extend_from_slice(b"\x1b[?2004l\x1b[0m\x1b[?25h\x1b[?1049l");
+            let _ = Self::write(&restore);
         }
         let _ = os::set_term(0, &self.original, true);
         let _ = os::set_flags(1, self.flags);
@@ -1223,8 +1497,11 @@ pub fn pick(o: &Options, mut open: impl FnMut(Choice, &mut bool) -> Result<()>) 
 
 fn choose(o: &Options, model: &mut Model) -> Result<Choice> {
     let _signals = os::picker_signals()?;
-    let _terminal = Terminal::enter()?;
-    let mut decoder = Decoder::default();
+    let mut terminal = Terminal::enter()?;
+    let mut decoder = Decoder {
+        control_detach: o.detach.filter(u8::is_ascii_control),
+        ..Decoder::default()
+    };
     let mut dirty = true;
     loop {
         let signals = os::take_signals();
@@ -1251,13 +1528,18 @@ fn choose(o: &Options, model: &mut Model) -> Result<Choice> {
             match os::read(0, &mut bytes) {
                 Ok(0) => return Ok(Choice::Exit),
                 Ok(n) => {
+                    keys = decoder.feed(&bytes[..n]);
+                    for key in &keys {
+                        if let Key::XtermMode(mode) = key {
+                            terminal.xterm_mode.get_or_insert(*mode);
+                        }
+                    }
                     if bytes[..n]
                         .iter()
                         .any(|b| matches!(b, 3 | 4) || b.is_ascii_control() && Some(*b) == o.detach)
                     {
                         return Ok(Choice::Exit);
                     }
-                    keys = decoder.feed(&bytes[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e.into()),
@@ -1268,6 +1550,9 @@ fn choose(o: &Options, model: &mut Model) -> Result<Choice> {
         }
         keys.extend(decoder.expire());
         for key in keys {
+            if matches!(key, Key::XtermMode(_)) {
+                continue;
+            }
             let layout = Layout::new(height, model.focus);
             let inner = width.saturating_sub(5).max(1);
             model.clamp(inner, layout);
@@ -1431,6 +1716,345 @@ mod tests {
         }
     }
     #[test]
+    fn force_stop_requires_complete_explicit_control_shift_events() {
+        for input in [
+            "\x1b[107;6u",
+            "\x1b[75;6u",
+            "\x1b[1083;6u",
+            "\x1b[1051;6u",
+            "\x1b[1083:1051:107;6:1u",
+            "\x1b[1083::107;6u",
+            "\x1b[27;6;107~",
+            "\x1b[27;6;75~",
+            "\x1b[27;6;1083~",
+            "\x1b[27;6;1051~",
+            "\x1b[107;70u",
+            "\x1b[107;134u",
+            "\x1b[107;198u",
+            "\x1b[27;70;75~",
+        ] {
+            for split in 1..input.len() {
+                let mut decoder = Decoder::default();
+                assert!(decoder.feed(&input.as_bytes()[..split]).is_empty());
+                if split > 1 {
+                    decoder.since = Instant::now().checked_sub(Duration::from_secs(1));
+                }
+                assert_eq!(decoder.expire(), None);
+                assert_eq!(decoder.feed(&input.as_bytes()[split..]), [Key::ForceStop]);
+            }
+        }
+        for codepoint in [75, 107, 1051, 1083] {
+            for modifier in [0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 65, 71, 135, 199] {
+                for input in [
+                    format!("\x1b[{codepoint};{modifier}u"),
+                    format!("\x1b[27;{modifier};{codepoint}~"),
+                ] {
+                    let mut decoder = Decoder::default();
+                    assert!(!decoder.feed(input.as_bytes()).contains(&Key::ForceStop));
+                }
+            }
+        }
+        for input in [
+            "k",
+            "K",
+            "л",
+            "Л",
+            "\x0b",
+            "\x1b[107;6:3u",
+            "\x1b[107;6:0u",
+            "\x1b[107;6:4u",
+            "\x1b[107;6;1u",
+            "\x1b[107:;6u",
+            "\x1b[107:75:107:1;6u",
+            "\x1b[107;6:1:1u",
+            "\x1b[107;u",
+            "\x1b[107;+6u",
+            "\x1b[107;06x",
+            "\x1b[27;6;107;1~",
+            "\x1b[27;6;107u",
+            "\x1bO107;6u",
+            "\x1bO27;6;107~",
+            "\x1b[55296;6u",
+            "\x1b[107:55296;6u",
+            "\x1b[107::55296;6u",
+            "\x1b[999999999999999999999999999999999999999;6u",
+        ] {
+            for chunk in 1..=input.len() {
+                let mut decoder = Decoder::default();
+                let keys = input
+                    .as_bytes()
+                    .chunks(chunk)
+                    .flat_map(|part| decoder.feed(part))
+                    .collect::<Vec<_>>();
+                assert!(!keys.contains(&Key::ForceStop), "{input:?}");
+            }
+        }
+        for input in ["\x1b[100;3u", "\x1b[99;7u", "\x1b[27;3;110~"] {
+            assert!(Decoder::default().feed(input.as_bytes()).is_empty());
+        }
+    }
+    #[test]
+    fn enhanced_control_keys_shift_letters_and_backtab_keep_their_meaning() {
+        for (input, expected) in [
+            ("\x1b[99;5u", Key::Char('\u{3}')),
+            ("\x1b[100;5u", Key::Char('\u{4}')),
+            ("\x1b[92;5u", Key::Char('\u{1c}')),
+            ("\x1b[93;5u", Key::Char('\u{1d}')),
+            ("\x1b[32;5u", Key::Char('\0')),
+            ("\x1b[63;5u", Key::Char('\u{7f}')),
+            ("\x1b[107;5u", Key::Char('\u{b}')),
+            ("\x1b[27;5;99~", Key::Char('\u{3}')),
+            ("\x1b[27;5;100~", Key::Char('\u{4}')),
+            ("\x1b[27;5;92~", Key::Char('\u{1c}')),
+            ("\x1b[27;5;32~", Key::Char('\0')),
+            ("\x1b[27;5;63~", Key::Char('\u{7f}')),
+            ("\x1b[27u", Key::Escape),
+            ("\x1b[9;2u", Key::BackTab),
+            ("\x1b[27;2;9~", Key::BackTab),
+            ("\x1b[13u", Key::Enter),
+            ("\x1b[9u", Key::Tab),
+            ("\x1b[127u", Key::Backspace),
+            ("\x1b[27;2;75~", Key::Char('K')),
+            ("\x1b[107;2u", Key::Char('K')),
+            ("\x1b[1083;2u", Key::Char('Л')),
+            ("\x1b[97:64;2u", Key::Char('@')),
+            ("\x1b[49:33;2u", Key::Char('!')),
+            ("\x1b[13;2u", Key::Enter),
+            ("\x1b[127;2u", Key::Backspace),
+            ("\x1b[1089::99;69u", Key::Char('\u{3}')),
+            ("\x1b[1074::100;133u", Key::Char('\u{4}')),
+            ("\x1b[1098::93;197u", Key::Char('\u{1d}')),
+            ("\x1b[107;65u", Key::Char('k')),
+            ("\x1b[9;194u", Key::BackTab),
+        ] {
+            for chunk in 1..=input.len() {
+                let mut decoder = Decoder::default();
+                let keys = input
+                    .as_bytes()
+                    .chunks(chunk)
+                    .flat_map(|part| decoder.feed(part))
+                    .collect::<Vec<_>>();
+                assert_eq!(keys, [expected], "{input:?}");
+            }
+        }
+    }
+    #[test]
+    fn lock_flags_keep_canonical_function_keys_and_keypad_navigation() {
+        for (code, suffix, expected) in [
+            (1, 'A', Key::Up),
+            (1, 'B', Key::Down),
+            (1, 'C', Key::Right),
+            (1, 'D', Key::Left),
+            (1, 'H', Key::Home),
+            (1, 'F', Key::End),
+            (7, '~', Key::Home),
+            (8, '~', Key::End),
+            (5, '~', Key::PageUp),
+            (6, '~', Key::PageDown),
+            (2, '~', Key::Insert),
+            (3, '~', Key::Delete),
+            (1, 'Q', Key::F2),
+            (12, '~', Key::F2),
+        ] {
+            for modifier in [65, 129, 193] {
+                let input = format!("\x1b[{code};{modifier}{suffix}");
+                for chunk in 1..=input.len() {
+                    let mut decoder = Decoder::default();
+                    let keys = input
+                        .as_bytes()
+                        .chunks(chunk)
+                        .flat_map(|part| decoder.feed(part))
+                        .collect::<Vec<_>>();
+                    assert_eq!(keys, [expected]);
+                }
+            }
+        }
+        for (code, expected) in [
+            (57414, Key::Enter),
+            (57417, Key::Left),
+            (57418, Key::Right),
+            (57419, Key::Up),
+            (57420, Key::Down),
+            (57421, Key::PageUp),
+            (57422, Key::PageDown),
+            (57423, Key::Home),
+            (57424, Key::End),
+            (57425, Key::Insert),
+            (57426, Key::Delete),
+            (57400, Key::Char('1')),
+        ] {
+            for modifier in [1, 65, 129, 193] {
+                let input = format!("\x1b[{code};{modifier}u");
+                assert_eq!(Decoder::default().feed(input.as_bytes()), [expected]);
+            }
+        }
+        for input in [
+            "\x1b[57358u",
+            "\x1b[57428u",
+            "\x1b[63743u",
+            "\x1b[57426;2u",
+            "\x1b[3;66~",
+            "\x1b[12;69~",
+            "\x1bO1;65Q",
+        ] {
+            assert!(Decoder::default().feed(input.as_bytes()).is_empty());
+        }
+    }
+    #[test]
+    fn enhanced_control_aliases_keep_editor_actions_after_detach_priority() {
+        for (code, control) in [
+            (50, 0),
+            (51, 27),
+            (52, 28),
+            (53, 29),
+            (54, 30),
+            (55, 31),
+            (56, 127),
+            (47, 31),
+            (96, 0),
+            (123, 27),
+            (124, 28),
+            (125, 29),
+            (126, 30),
+            (91, 27),
+            (104, 8),
+            (105, 9),
+            (106, 10),
+            (109, 13),
+        ] {
+            for input in [format!("\x1b[{code};5u"), format!("\x1b[27;5;{code}~")] {
+                let keys = Decoder::default().feed(input.as_bytes());
+                assert_eq!(keys, [Key::Char(char::from(control))]);
+                let mut m = model();
+                m.naming = Some(Naming {
+                    text: "ab".into(),
+                    cursor: 2,
+                });
+                assert!(matches!(
+                    m.key(keys[0], 75, Layout::new(24, m.focus), Some(control)),
+                    Some(Choice::Exit)
+                ));
+            }
+        }
+        let mut m = model();
+        m.naming = Some(Naming {
+            text: "ab".into(),
+            cursor: 2,
+        });
+        m.key(Key::Char('\u{8}'), 75, Layout::new(24, m.focus), None);
+        assert_eq!(m.naming.as_ref().unwrap().text, "a");
+        m.key(Key::Char('\u{1b}'), 75, Layout::new(24, m.focus), None);
+        assert!(m.naming.is_none());
+        m.key(Key::Char('\t'), 75, Layout::new(24, m.focus), None);
+        assert_eq!(m.focus, Focus::Beginning);
+        for key in [Key::Char('\r'), Key::Char('\n')] {
+            m.naming = Some(Naming {
+                text: String::new(),
+                cursor: 0,
+            });
+            m.message.clear();
+            assert!(m.key(key, 75, Layout::new(24, m.focus), None).is_none());
+            assert!(m.message.contains("nonempty"));
+        }
+    }
+    #[test]
+    fn enhanced_paste_preserves_only_control_exits_and_mode_replies() {
+        for (input, detach, expected) in [
+            ("\x1b[99;5u", None, Key::Char('\u{3}')),
+            ("\x1b[100;133u", None, Key::Char('\u{4}')),
+            ("\x1b[27;5;99~", None, Key::Char('\u{3}')),
+            ("\x1b[27;5;100~", None, Key::Char('\u{4}')),
+            ("\x1b[93;5u", Some(29), Key::Char('\u{1d}')),
+            ("\x1b[27;5;93~", Some(29), Key::Char('\u{1d}')),
+            ("\x1b[1089::99;69u", None, Key::Char('\u{3}')),
+            ("\x1b[>4;1m", None, Key::XtermMode(1)),
+        ] {
+            let input = format!("\x1b[200~before{input}after\x1b[201~");
+            for chunk in 1..=input.len() {
+                let mut decoder = Decoder {
+                    control_detach: detach,
+                    ..Decoder::default()
+                };
+                let keys = input
+                    .as_bytes()
+                    .chunks(chunk)
+                    .flat_map(|part| decoder.feed(part))
+                    .collect::<Vec<_>>();
+                let mut expected_keys = "before".chars().map(Key::Paste).collect::<Vec<_>>();
+                expected_keys.push(expected);
+                expected_keys.extend("after".chars().map(Key::Paste));
+                assert_eq!(keys, expected_keys);
+            }
+        }
+        for input in [
+            "\x1b[93;5u",
+            "\x1b[99;5:3u",
+            "\x1b[107;198u",
+            "\x1b[27;6;75~",
+        ] {
+            let input = format!("\x1b[200~{input}\x1b[201~");
+            let keys = Decoder::default().feed(input.as_bytes());
+            assert!(keys.iter().all(|key| matches!(key, Key::Paste(_))));
+        }
+    }
+    #[test]
+    fn xterm_mode_replies_are_bounded_known_control_events() {
+        for mode in [-1, 0, 1, 2, 3] {
+            let input = format!("\x1b[>4;{mode}m");
+            for chunk in 1..=input.len() {
+                let mut decoder = Decoder::default();
+                let keys = input
+                    .as_bytes()
+                    .chunks(chunk)
+                    .flat_map(|part| decoder.feed(part))
+                    .collect::<Vec<_>>();
+                assert_eq!(keys, [Key::XtermMode(mode)]);
+                let mut m = model();
+                m.naming = Some(Naming {
+                    text: "keep".into(),
+                    cursor: 4,
+                });
+                assert!(m.key(keys[0], 75, Layout::new(24, m.focus), None).is_none());
+                assert_eq!(m.naming.as_ref().unwrap().text, "keep");
+                assert!(m.message.is_empty());
+            }
+        }
+        for input in [
+            "\x1b[>4;4m",
+            "\x1b[>4;-2m",
+            "\x1b[>4;+1m",
+            "\x1b[>4;1;2m",
+            "\x1b[>5;1m",
+            "\x1bO>4;1m",
+        ] {
+            assert!(Decoder::default().feed(input.as_bytes()).is_empty());
+        }
+    }
+    #[test]
+    fn enhanced_force_stop_is_ignored_in_names_and_literal_in_paste() {
+        for encoding in ["\x1b[107;6u", "\x1b[27;6;75~"] {
+            let mut m = model();
+            m.naming = Some(Naming {
+                text: "keep".into(),
+                cursor: 4,
+            });
+            for key in Decoder::default().feed(encoding.as_bytes()) {
+                assert!(m.key(key, 75, Layout::new(24, m.focus), None).is_none());
+            }
+            assert_eq!(m.naming.as_ref().unwrap().text, "keep");
+            let input = format!("\x1b[200~{encoding}\x1b[201~");
+            for chunk in 1..=input.len() {
+                let mut decoder = Decoder::default();
+                let keys = input
+                    .as_bytes()
+                    .chunks(chunk)
+                    .flat_map(|part| decoder.feed(part))
+                    .collect::<Vec<_>>();
+                assert!(keys.iter().all(|key| matches!(key, Key::Paste(_))));
+            }
+        }
+    }
+    #[test]
     fn focus_and_scroll_offsets_are_independent_and_resize_clamps() {
         let mut m = model();
         let rendered = String::from_utf8(m.render(80, 24)).unwrap();
@@ -1457,7 +2081,7 @@ mod tests {
     }
     #[test]
     fn english_and_russian_keys_match_arrows_in_each_pane_and_remain_literal_in_names() {
-        for keys in [['j', 'k', 'h', 'l'], ['о', 'л', 'р', 'д']] {
+        for keys in [['k', 'j', 'h', 'l'], ['л', 'о', 'р', 'д']] {
             for focus in [Focus::List, Focus::Beginning, Focus::Ending] {
                 let mut shortcuts = model();
                 let mut arrows = model();
@@ -1471,7 +2095,7 @@ mod tests {
                 }
                 for (key, arrow) in
                     keys.into_iter()
-                        .zip([Key::Down, Key::Up, Key::Left, Key::Right])
+                        .zip([Key::Up, Key::Down, Key::Left, Key::Right])
                 {
                     shortcuts.key(Key::Char(key), 80, Layout::new(24, focus), Some(28));
                     arrows.key(arrow, 80, Layout::new(24, focus), Some(28));
@@ -1498,6 +2122,30 @@ mod tests {
         assert_eq!(m.naming.as_ref().unwrap().text, name);
         assert_eq!(m.selected, 0);
         assert_eq!(m.offsets, [0, usize::MAX]);
+    }
+    #[test]
+    fn upward_shortcuts_keep_navigating_in_small_layouts() {
+        for (width, height) in [(75, 24), (15, 24), (75, 6), (1, 1)] {
+            for focus in [Focus::List, Focus::Beginning, Focus::Ending] {
+                for key in ['k', 'л'] {
+                    let mut m = model();
+                    m.focus = focus;
+                    m.selected = 3;
+                    m.offsets = [10, 20];
+                    assert!(
+                        m.key(Key::Char(key), width, Layout::new(height, focus), None)
+                            .is_none()
+                    );
+                    match focus {
+                        Focus::List => assert_eq!(m.selected, 2),
+                        Focus::Beginning => assert_eq!(m.offsets, [9, 20]),
+                        Focus::Ending => assert_eq!(m.offsets, [10, 19]),
+                    }
+                    assert!(m.message.is_empty());
+                    assert_eq!(m.entries.len(), 10);
+                }
+            }
+        }
     }
     #[test]
     fn russian_shortcuts_wait_for_complete_utf8_and_do_not_add_shifted_bindings() {
@@ -1536,6 +2184,12 @@ mod tests {
     fn original_detach_character_takes_priority_over_shortcuts() {
         let mut m = model();
         m.dir = std::env::temp_dir().join(format!("rtch-picker-detach-{}", std::process::id()));
+        assert!(matches!(
+            m.key(Key::Char('k'), 80, Layout::new(24, m.focus), Some(b'k')),
+            Some(Choice::Exit)
+        ));
+        assert_eq!(m.selected, 0);
+        assert_eq!(m.message, "");
         assert!(matches!(
             m.key(Key::Char('n'), 80, Layout::new(24, m.focus), Some(b'n')),
             Some(Choice::Exit)
@@ -1648,6 +2302,9 @@ mod tests {
                 Key::Char('c'),
                 Key::Char('в'),
                 Key::Char('с'),
+                Key::ForceStop,
+                Key::Char('k'),
+                Key::Char('л'),
             ] {
                 assert!(
                     m.key(key, width, Layout::new(height, m.focus), None)
@@ -1690,7 +2347,7 @@ mod tests {
             text: "界e\u{301}👩‍💻jkhlqdcnолрдйвст".into(),
             cursor: 3,
         });
-        for key in [Key::Insert, Key::F2] {
+        for key in [Key::Insert, Key::F2, Key::ForceStop] {
             assert!(m.key(key, 75, Layout::new(24, m.focus), None).is_none());
             assert_eq!(
                 m.naming.as_ref().unwrap().text,
@@ -1727,6 +2384,9 @@ mod tests {
             (196, 95),
             (30, 20),
             (31, 20),
+            (32, 20),
+            (33, 20),
+            (34, 20),
             (40, 20),
             (20, 6),
             (12, 3),
@@ -1756,9 +2416,16 @@ mod tests {
                 }
                 if height >= 20 && width >= 30 {
                     assert!(hint.contains("Enter") && hint.contains("Del"));
-                    assert!(hint.contains("F2 clean logs") || hint.contains("F2:clear"));
+                    assert!(
+                        hint.contains("F2")
+                            && (hint.contains("Ctrl+Shift+K")
+                                || hint.contains("C-S-K")
+                                || hint.contains("^⇧K"))
+                    );
                 } else {
-                    assert!(!hint.contains("Del") && !hint.contains("F2"));
+                    assert!(
+                        !hint.contains("Del") && !hint.contains("F2") && !hint.contains("kill")
+                    );
                 }
             }
         }
@@ -1776,7 +2443,7 @@ mod tests {
             assert!(m.naming.is_none());
         }
         for (width, height) in [(75, 19), (24, 24)] {
-            for key in [Key::Delete, Key::F2] {
+            for key in [Key::Delete, Key::F2, Key::ForceStop] {
                 assert!(
                     m.key(key, width, Layout::new(height, m.focus), None)
                         .is_none()

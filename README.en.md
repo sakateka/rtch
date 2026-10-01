@@ -82,7 +82,7 @@ or rotated full-screen history can reconstruct approximately. Non-TTY invocation
 print command guidance without entering raw mode.
 
 - `Tab` / `Shift+Tab`: cycle List → Beginning → Ending; the focused preview expands.
-- Up/Down, `j`/`о` (down), `k`/`л` (up), `PageUp`/`PageDown`, `Home`/`End`: move or scroll logical rows in the focused pane.
+- Up/Down, `k`/`л` (up), `j`/`о` (down), `PageUp`/`PageDown`, `Home`/`End`: move or scroll logical rows in the focused pane.
 - Left/Right, `h`/`р` (left), or `l`/`д` (right): scroll the focused preview horizontally by columns.
   Beginning and Ending keep independent offsets; these keys do nothing in the list.
 - `Enter`: attach a detached running session, or restart an ended/stale session
@@ -96,6 +96,11 @@ print command guidance without entering raw mode.
   Latin and Russian shortcut letters are literal name characters, except the configured
   printable detach key: its original character still exits. Names are limited to 107 bytes;
   pasting a newline does not submit the name.
+- `Ctrl+Shift+K`: immediately force-stop the selected running or attached session with SIGKILL,
+  including foreground and background jobs in its Unix session. Attached clients disconnect;
+  history stays and the same row becomes ended. The picker stays open; press Delete afterward to remove it.
+  This also works with supervisors started before the picker update. Jobs that used `setsid`
+  to leave the original Unix session are outside this cleanup.
 - `Delete` (also `d`/`в`): delete the selected ended/stale session and its artifacts, then select a neighbour.
   Live sessions, including attached ones, cannot be deleted.
 - `F2` (also `c`/`с`): clear retained logs and live replay history, preserving the session,
@@ -104,15 +109,18 @@ print command guidance without entering raw mode.
 - `q`/`й`, `Esc`, `Ctrl+C`, `Ctrl+D`, or the configured detach key: return to the invoking shell.
 
 Arrows, `Tab`/`Shift+Tab`, `Enter`, `Escape`, `Insert`, `Delete`, and `F2` provide
-complete picker control in any keyboard layout. The lowercase English QWERTY and
-standard Russian JCUKEN shortcuts above remain optional additional controls;
-name characters are kept as typed.
+navigation, opening, creation, deletion, and cleaning in any keyboard layout.
+Force-stop requires a terminal that distinguishes Ctrl and Shift using the kitty/CSI-u
+keyboard protocol or xterm modifyOtherKeys. Use `Ctrl+Shift+K` in English QWERTY
+or `Ctrl+Shift+Л` on the same physical key in standard Russian JCUKEN. Legacy
+terminals that send the same byte for `Ctrl+K` and `Ctrl+Shift+K` cannot use this
+picker shortcut; `rtch kill -f SESSION` remains available. Name characters are kept as typed.
 Bracketed paste never triggers shortcut letters or function-key actions. `Ctrl+C`, `Ctrl+D`, and a
 configured control detach key still exit during paste. After opening a session, shortcut
 letters and all navigation, `Insert`, `Delete`, and `F2` bytes pass unchanged to the application,
 except for the configured detach byte when detachment is enabled.
 
-Small terminals show a resize hint; delete and clean require the full picker layout.
+Small terminals show a resize hint; force-stop, delete, and clean require the full picker layout.
 If the session directory is busy, retry the action after it becomes available.
 Creation waits for a resize if the proposed
 name cannot be displayed. Picker exits,
