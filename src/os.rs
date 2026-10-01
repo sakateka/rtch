@@ -17,13 +17,83 @@ extern "C" fn signal(sig: libc::c_int) {
 pub fn take_signals() -> i32 {
     SIGNALS.swap(0, Ordering::Relaxed)
 }
+pub fn lock(fd: RawFd) -> io::Result<()> {
+    loop {
+        // SAFETY: flock borrows the open directory descriptor for this call.
+        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+pub fn try_lock(fd: RawFd) -> io::Result<bool> {
+    // SAFETY: flock borrows the open directory descriptor for this call.
+    if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
 pub fn signals(server: bool) -> io::Result<()> {
+    install_signals(server, false)
+}
+pub struct PickerSignals {
+    previous: Vec<(libc::c_int, libc::sigaction)>,
+}
+pub fn picker_signals() -> io::Result<PickerSignals> {
+    let mut guard = PickerSignals {
+        previous: Vec::new(),
+    };
+    for sig in [
+        libc::SIGTERM,
+        libc::SIGINT,
+        libc::SIGWINCH,
+        libc::SIGHUP,
+        libc::SIGPIPE,
+        libc::SIGQUIT,
+    ] {
+        // SAFETY: sigaction initializes the plain C struct; the null action
+        // argument queries the current disposition without changing it.
+        let previous = unsafe {
+            let mut previous: libc::sigaction = std::mem::zeroed();
+            if libc::sigaction(sig, std::ptr::null(), &raw mut previous) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            previous
+        };
+        guard.previous.push((sig, previous));
+    }
+    install_signals(false, true)?;
+    Ok(guard)
+}
+impl Drop for PickerSignals {
+    fn drop(&mut self) {
+        for (sig, previous) in &self.previous {
+            // SAFETY: each previous action came from sigaction and remains
+            // initialized; no borrowed pointer survives this call.
+            unsafe {
+                libc::sigaction(*sig, previous, std::ptr::null_mut());
+            }
+        }
+    }
+}
+fn install_signals(server: bool, picker: bool) -> io::Result<()> {
     // SAFETY: sigaction is a plain C struct; handlers only use lock-free atomics.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         libc::sigemptyset(&raw mut action.sa_mask);
         action.sa_sigaction = signal as *const () as libc::sighandler_t;
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGWINCH, libc::SIGHUP] {
+        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGWINCH, libc::SIGHUP]
+            .into_iter()
+            .chain(picker.then_some(libc::SIGQUIT))
+        {
             action.sa_sigaction = if server && sig == libc::SIGHUP {
                 libc::SIG_IGN
             } else {

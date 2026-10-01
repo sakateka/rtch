@@ -24,6 +24,8 @@ pub struct Options {
     pub clear: String,
     pub ansi: bool,
     pub wait: bool,
+    pub exclusive: bool,
+    pub detached_only: bool,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -43,6 +45,8 @@ impl Default for Options {
             clear: "none".into(),
             ansi: true,
             wait: false,
+            exclusive: false,
+            detached_only: false,
         }
     }
 }
@@ -121,8 +125,8 @@ fn setting(id: &'static str, short: char, help: &'static str) -> Arg {
 #[allow(clippy::too_many_lines)]
 pub fn command() -> Command {
     let mut cmd=Command::new("rtch").version(env!("CARGO_PKG_VERSION"))
-        .about("Persistent terminal sessions; ended sessions require an explicit new")
-        .after_help("Config: ~/.config/rtch/config — session_dir = /absolute/path\nWithout PROGRAM, starts $SHELL as a login shell. Ctrl+\\ detaches; or run rtch detach SESSION elsewhere.")
+        .about("Persistent terminal sessions; picker Enter opens or restarts the selected session")
+        .after_help("Config: ~/.config/rtch/config — session_dir = /absolute/path\nNamed SESSION/attach never restart ended sessions; use new or picker Enter.\nWithout PROGRAM, including picker restart, starts current $SHELL as a fresh login shell in the invoking directory. Ctrl+\\ detaches; or run rtch detach SESSION elsewhere.")
         .subcommand_negates_reqs(true)
         .arg(session(Sessions::All)).arg(program())
         .arg(setting("quiet",'q',"Suppress status messages").global(true))
@@ -159,12 +163,20 @@ pub fn command() -> Command {
             sub = sub.hide(true);
         }
         if name == "__serve" {
-            sub = sub.hide(true).arg(
-                Arg::new("wait")
-                    .long("wait")
-                    .action(ArgAction::SetTrue)
-                    .hide(true),
-            );
+            sub = sub
+                .hide(true)
+                .arg(
+                    Arg::new("wait")
+                        .long("wait")
+                        .action(ArgAction::SetTrue)
+                        .hide(true),
+                )
+                .arg(
+                    Arg::new("exclusive")
+                        .long("exclusive")
+                        .action(ArgAction::SetTrue)
+                        .hide(true),
+                );
         }
         cmd = cmd.subcommand(sub);
     }
@@ -201,6 +213,11 @@ pub fn command() -> Command {
     )
     .subcommand(Command::new("ended").about("List ended sessions only"))
     .subcommand(Command::new("current").about("Print the current session ancestry"))
+    .subcommand(
+        Command::new("pick")
+            .about("Browse previews; Enter attaches or restarts with the current login shell"),
+    )
+    .subcommand(Command::new("shell-init").about("Print a POSIX login-shell picker hook"))
     .subcommand(
         Command::new("clear")
             .about("Clear history; defaults to the current session")
@@ -260,13 +277,11 @@ fn parse_with(args: Vec<OsString>, defaults: impl FnOnce() -> Result<Options>) -
         };
     let (name, m) = root.subcommand().unwrap_or(("open", &root));
     let session = m.try_get_one::<PathBuf>("session").ok().flatten().cloned();
-    if name == "open" && session.is_none() {
-        command().print_help()?;
-        return Ok(Options {
-            command: "noop".into(),
-            ..Options::default()
-        });
-    }
+    let name = if name == "open" && session.is_none() {
+        "pick"
+    } else {
+        name
+    };
     let flag = |key: &str| {
         m.try_get_one::<bool>(key)
             .ok()
@@ -302,6 +317,8 @@ fn parse_with(args: Vec<OsString>, defaults: impl FnOnce() -> Result<Options>) -
         suspend: !flag("no-suspend"),
         ansi: !flag("no-ansi"),
         wait: flag("wait"),
+        exclusive: flag("exclusive"),
+        detached_only: false,
         redraw: m.get_one::<String>("redraw").expect("clap default").clone(),
         clear: m
             .get_one::<String>("clear-mode")

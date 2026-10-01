@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod history;
 mod os;
+mod picker;
 mod reactor;
 mod server;
 mod storage;
@@ -60,10 +61,59 @@ fn tail(o: &cli::Options, path: &Path) -> Result<()> {
     }
     Ok(())
 }
+fn picker_choice(o: &cli::Options) -> Result<()> {
+    picker::pick(o, |choice, established| {
+        let mut selected = o.clone();
+        selected.detached_only = true;
+        match choice {
+            picker::Choice::Attach(path) | picker::Choice::Restart(path) => {
+                let path = storage::resolve(&path)?;
+                selected.exclusive = false;
+                match storage::state(&path)? {
+                    storage::State::Running => {}
+                    storage::State::Attached => {
+                        return fail("Session is attached; busy with another client.");
+                    }
+                    storage::State::Ended | storage::State::Stale => {
+                        server::start(&selected, &path, true)?;
+                    }
+                    storage::State::Missing => return fail("Session is missing."),
+                }
+                client::attach_with_status(&selected, &path, established)
+            }
+            picker::Choice::Create(path) => {
+                let path = storage::resolve(&path)?;
+                selected.exclusive = true;
+                server::start(&selected, &path, true)?;
+                client::attach_with_status(&selected, &path, established)
+            }
+            picker::Choice::Exit => unreachable!("handled above"),
+        }
+    })
+}
+fn clear_session(path: &Path) -> Result<()> {
+    if matches!(
+        storage::state(path)?,
+        storage::State::Running | storage::State::Attached
+    ) {
+        client::control(path, server::CLEAR, false)
+    } else {
+        storage::clear_files(path)
+    }
+}
 fn run() -> Result<()> {
     let o = cli::parse(std::env::args_os().skip(1).collect())?;
+    if matches!(
+        o.command.as_str(),
+        "pick" | "new" | "start" | "run" | "attach" | "open" | "__serve"
+    ) && std::env::var_os("RTCH_SESSION").is_some_and(|session| !session.is_empty())
+    {
+        return fail("already inside rtch; nested session startup or attachment is not allowed");
+    }
     match o.command.as_str() {
         "noop" => return Ok(()),
+        "shell-init" => return picker::shell_init(),
+        "pick" => return picker_choice(&o),
         "version" => {
             println!("rtch {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
@@ -136,24 +186,7 @@ fn run() -> Result<()> {
         "detach" => client::control(&path, server::DETACH, false),
         "kill" => client::control(&path, server::KILL, o.force),
         "tail" => tail(&o, &path),
-        "clear" => {
-            if matches!(
-                storage::state(&path)?,
-                storage::State::Running | storage::State::Attached
-            ) {
-                client::control(&path, server::CLEAR, false)
-            } else {
-                match storage::open_file(&storage::side(&path, ".log"), false) {
-                    Ok(f) => {
-                        drop(f);
-                        storage::open_file(&storage::side(&path, ".log"), true)?.set_len(0)?;
-                        Ok(())
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e.into()),
-                }
-            }
-        }
+        "clear" => clear_session(&path),
         "rm" => storage::remove(&path),
         _ => fail("unknown command"),
     }

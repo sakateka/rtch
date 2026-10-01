@@ -24,6 +24,9 @@ pub const REDRAW: u8 = 4;
 pub const KILL: u8 = 5;
 pub const DETACH: u8 = 6;
 pub const CLEAR: u8 = 7;
+pub const CAPABILITIES: u8 = 8;
+pub const ATTACH_FREE: u8 = 9;
+pub const PICKER_CAPABILITY: &[u8; 2] = b"FA";
 pub fn packet(kind: u8, data: &[u8]) -> [u8; 10] {
     let mut p = [0; 10];
     p[0] = kind;
@@ -85,16 +88,24 @@ impl Drop for ChildGuard {
 pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result<i32> {
     let mut reactor = crate::reactor::Reactor::new()?;
     storage::ensure_parent(path)?;
-    match storage::state(path)? {
-        State::Running | State::Attached => return fail("session is already running"),
-        State::Stale => fs::remove_file(path)?,
-        _ => {}
+    let startup_lock = storage::lock_parent(path)?;
+    if !o.exclusive {
+        match storage::state(path)? {
+            State::Running | State::Attached => return fail("session is already running"),
+            State::Stale => fs::remove_file(path)?,
+            _ => {}
+        }
     }
     let previous_mask = os::umask(0o077);
     let listener = storage::bind(path);
     os::umask(previous_mask);
     let listener = listener?;
     let _socket = SocketGuard(path);
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    if o.exclusive && storage::history_exists(path)? {
+        return fail("session name is already occupied");
+    }
+    drop(startup_lock);
     listener.set_nonblocking(true)?;
     let term = os::term(0).ok();
     let size = os::size(0);
@@ -225,8 +236,9 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
         }
         reactor.wait(&mut fds, 100)?;
         let mut detach_all = false;
+        let mut attached_count = clients.iter().filter(|c| c.attached && !c.close).count();
         for (c, pfd) in clients.iter_mut().zip(&fds[2..]) {
-            if pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+            if !c.finishing && pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
                 let mut buf = [0; 8192];
                 match c.stream.read(&mut buf) {
                     Ok(0) => c.close = true,
@@ -247,8 +259,20 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                             }
                             input.extend(&p[2..2 + usize::from(p[1])]);
                         }
-                        ATTACH if !c.attached => {
+                        CAPABILITIES if !c.attached && c.output.is_empty() => {
+                            c.output.extend(PICKER_CAPABILITY);
+                        }
+                        ATTACH | ATTACH_FREE if !c.attached => {
+                            if p[0] == ATTACH_FREE {
+                                if attached_count > 0 {
+                                    c.output.extend(b"NO");
+                                    c.finishing = true;
+                                    break;
+                                }
+                                c.output.extend(b"OK");
+                            }
                             c.attached = true;
+                            attached_count += 1;
                             if c.output.len() + log.history.len()
                                 > o.cap.saturating_add(8 * 1024 * 1024)
                             {
@@ -257,8 +281,11 @@ pub fn serve(o: &Options, path: &Path, ready: bool, wait_attach: bool) -> Result
                             }
                             c.output.extend(&log.history);
                         }
-                        ATTACH => {}
-                        SUSPEND => c.attached = false,
+                        SUSPEND if c.attached => {
+                            c.attached = false;
+                            attached_count = attached_count.saturating_sub(1);
+                        }
+                        CAPABILITIES | ATTACH | ATTACH_FREE | SUSPEND => {}
                         WINCH | REDRAW => {
                             os::set_size(master.as_raw_fd(), winsize(p))?;
                             if p[0] == REDRAW && p[1] == 2 {
@@ -414,6 +441,9 @@ pub fn start(o: &Options, path: &Path, wait: bool) -> Result<()> {
     use std::io::BufRead;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("__serve").arg("-C").arg(o.cap.to_string());
+    if o.exclusive {
+        cmd.arg("--exclusive");
+    }
     if wait {
         cmd.arg("--wait");
     }
