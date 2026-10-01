@@ -38,7 +38,7 @@ impl Default for Options {
             all: false,
             follow: false,
             lines: 10,
-            cap: 1024 * 1024,
+            cap: 8 * 1024 * 1024,
             detach: Some(28),
             suspend: true,
             redraw: "winch".into(),
@@ -60,8 +60,8 @@ pub(crate) fn size(s: &str) -> std::result::Result<usize, String> {
         .parse::<usize>()
         .ok()
         .and_then(|n| n.checked_mul(mult));
-    n.filter(|&n| n <= 256 * 1024 * 1024)
-        .ok_or_else(|| "invalid log size (maximum 256m)".into())
+    n.filter(|&n| n == 0 || (256..=256 * 1024 * 1024).contains(&n))
+        .ok_or_else(|| "invalid log size (0 disables; minimum 256 bytes, maximum 256m)".into())
 }
 #[derive(Clone, Copy)]
 enum Sessions {
@@ -133,7 +133,7 @@ pub fn command() -> Command {
         .arg(setting("no-detach",'E',"Disable the detach key").global(true))
         .arg(setting("no-suspend",'z',"Pass Ctrl+Z through").global(true))
         .arg(setting("no-ansi",'t',"Disable ANSI terminal cleanup").global(true))
-        .arg(Arg::new("cap").short('C').value_name("SIZE").default_value("1m").value_parser(size).global(true).help("Log limit: bytes, k, m; 0 disables"))
+        .arg(Arg::new("cap").short('C').value_name("SIZE").default_value("8m").value_parser(size).global(true).help("Compressed history limit: bytes, k, m; minimum 256, 0 disables"))
         .arg(Arg::new("detach-key").short('e').value_name("KEY").default_value("^\\").global(true).value_parser(detach_key).help("Detach key, for example ^]"))
         .arg(Arg::new("redraw").short('r').default_value("winch").value_parser(["none","winch","ctrl_l"]).global(true))
         .arg(Arg::new("clear-mode").short('R').default_value("none").value_parser(["none","move"]).global(true));
@@ -355,6 +355,31 @@ mod tests {
     use super::*;
     fn parse(args: Vec<OsString>) -> Result<Options> {
         parse_with(args, || Ok(Options::default()))
+    }
+    #[test]
+    fn compressed_size_default_minimum_zero_maximum_and_shared_config_validation() {
+        assert_eq!(Options::default().cap, 8 * 1024 * 1024);
+        assert_eq!(
+            crate::config::Config::default().options.cap,
+            8 * 1024 * 1024
+        );
+        for value in ["1", "255", "257m", "18446744073709551615m"] {
+            assert!(size(value).is_err());
+            assert!(crate::config::Config::parse(&format!("log_size = {value}")).is_err());
+        }
+        for (value, expected) in [
+            ("0", 0),
+            ("256", 256),
+            ("8m", 8 * 1024 * 1024),
+            ("256m", 256 * 1024 * 1024),
+        ] {
+            assert_eq!(size(value).unwrap(), expected);
+        }
+        let options = parse_with(vec!["tail".into(), "session".into()], || {
+            Ok(Options::default())
+        })
+        .unwrap();
+        assert_eq!(options.cap, 8 * 1024 * 1024);
     }
     #[test]
     fn schema() {

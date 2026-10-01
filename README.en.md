@@ -176,7 +176,7 @@ File: `~/.config/rtch/config`.
 ```ini
 session_dir = /mnt/data/rtch
 quiet = false
-log_size = 1m
+log_size = 8m
 detach_key = ^\
 suspend = true
 ansi = true
@@ -193,7 +193,7 @@ Precedence: CLI → config → defaults. All values above except the example
 | --- | --- | --- |
 | `session_dir` | Absolute `SESSION` | Absolute, unquoted path |
 | `quiet` | `-q` | `true/false`, suppress status messages |
-| `log_size` | `-C SIZE` | Bytes, `k/m` suffixes; `0` disables logging; maximum `256m` |
+| `log_size` | `-C SIZE` | Compressed bytes, `k/m` suffixes; default `8m`; `0` disables logging; minimum positive `256` bytes, maximum `256m` |
 | `detach_key` | `-e KEY`, `-E` | One byte, `^X`; `none` disables the key |
 | `suspend` | `-z` disables | `true/false`, local Ctrl+Z handling |
 | `ansi` | `-t` disables | `true/false`, ANSI terminal reset on detach |
@@ -239,16 +239,37 @@ creation. Sessions refresh on every Tab.
 
 ## History and limits
 
-Logs default to 1 MiB; exceeding twice the limit retains the latest 1 MiB.
-`-C 4m` changes the limit; `-C 0` keeps only 128 KiB of memory history and
-a state file, without creating a persistent prefix. A private `.head` file retains
-the first `min(log limit, 64 KiB)` output bytes across log rotation and explicit
-restarts. Beginning emulates at most 64 KiB of this prefix; Ending emulates at most
-128 KiB of recent output including bounded parsing context, omitting an initial
-partial line. Beginning stops emulation before its earliest rows can be evicted
+History defaults to an 8 MiB compressed limit per session. The combined canonical
+`.log` and `.head` files, including framing, stay within this limit. Both use
+independent checksummed zstd level-1 frames with an rtch version/generation header
+and length/sequence trailers; each frame decodes to at most 128 KiB. Each PTY read
+(up to 8 KiB) publishes immediately. Rotation evicts oldest whole suffix records
+in batches through an atomic replacement. Its temporary encoded copy is excluded
+from the cap and is cleaned up after replacement. Supervisor reopen and session
+removal recover abandoned copies; live writers keep an exclusive lock on theirs.
+
+`-C 4m` changes the compressed limit; positive budgets below 256 bytes are rejected,
+and the maximum is 256 MiB. `-C 0` keeps only 128 KiB of memory history and a state
+file, without creating persistent history. Replay RAM is independently bounded
+by the configured byte budget (128 KiB when disabled). A private `.head` retains
+a contiguous beginning of up to 64 KiB decoded, using at most half the encoded
+budget. If that allowance omits any prefix bytes, capture seals until `clear`;
+it never resumes after a gap. Tiny budgets also shorten oversized suffix records
+to a fitting newest portion. Beginning emulates up to 64 KiB of this prefix;
+Ending emulates up to 128 KiB of recent output including bounded parsing context,
+omitting an initial partial line. Previews decode selected frames, and `tail`
+expands its decoded suffix only as needed for the requested lines, up to 256 MiB.
+`tail -f` tracks replacements, rotation, clear and restart without duplicating
+already seen retained records. Incomplete final records wait for completion;
+supervisor reopen discards them. Corrupt committed records produce errors.
+
+Beginning stops emulation before its earliest rows can be evicted
 from bounded scrollback. Reconstructed screen and scrollback rows support
 independent paging. `clear` empties both histories; `rm` removes both.
-Legacy sessions without `.head` show their earliest retained log output; a lost
+Legacy plaintext remains readable without modification, including output from old
+running supervisors. Only a new supervisor reopening the session converts its
+validated history to the compressed format. Legacy sessions without `.head` show
+their earliest retained log output; a lost
 beginning cannot be recovered. A control string whose opening was lost in
 rotation or lies outside the bounded window can leave ambiguous text fragments;
 recognized complete strings and orphaned terminators are handled conservatively.

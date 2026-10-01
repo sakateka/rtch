@@ -15,6 +15,7 @@ unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.3"
 ratatui = { version = "=0.30.2", default-features = false, features = ["std"] }
 vt100 = "=0.16.2"
+zstd = { version = "=0.13.3", default-features = false }
 
 [lints.rust]
 unsafe_code = "warn"

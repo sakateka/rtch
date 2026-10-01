@@ -2,13 +2,14 @@ mod cli;
 mod client;
 mod config;
 mod history;
+mod logfile;
 mod os;
 mod picker;
 mod reactor;
 mod server;
 mod storage;
 use std::{
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -18,17 +19,22 @@ fn fail<T>(message: impl Into<String>) -> Result<T> {
 fn current() -> Option<String> {
     std::env::var("RTCH_SESSION").ok().filter(|s| !s.is_empty())
 }
+#[allow(clippy::naive_bytecount)] // Avoid a dependency for counting bounded newlines.
 fn tail(o: &cli::Options, path: &Path) -> Result<()> {
     let mut file = storage::open_file(&storage::side(path, ".log"), false)?;
-    // Bound memory even when reading a log produced by another version.
-    let len = file.metadata()?.len();
-    file.seek(SeekFrom::Start(len.saturating_sub(256 * 1024 * 1024)))?;
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(256 * 1024 * 1024)
-        .read_to_end(&mut bytes)?;
-    let mut filter = history::Filter::default();
-    let rendered = filter.feed(&bytes);
+    // Start with a small decoded suffix; expand only for requested filtered lines.
+    let mut limit = storage::PREVIEW_LIMIT;
+    let (window, mut filter, rendered) = loop {
+        let window = logfile::read(&mut file, limit, false)?;
+        let mut filter = history::Filter::default();
+        let start = history::emulator_boundary(&window.bytes, window.cut);
+        let rendered = filter.feed(&window.bytes[start..]);
+        let lines = rendered.iter().filter(|&&c| c == b'\n').count();
+        if o.lines == 0 || lines > o.lines || !window.earlier || limit == 256 * 1024 * 1024 {
+            break (window, filter, rendered);
+        }
+        limit = (limit * 2).min(256 * 1024 * 1024);
+    };
     let mut count = 0;
     let mut start = 0;
     for (i, &c) in rendered.iter().enumerate().rev() {
@@ -45,16 +51,15 @@ fn tail(o: &cli::Options, path: &Path) -> Result<()> {
     }
     if o.follow {
         os::signals(false)?;
-        let mut buf = [0; 8192];
+        let mut follower = logfile::Follower::new(file, storage::side(path, ".log"), &window)?;
         while os::take_signals() & 1 == 0 {
-            if file.metadata()?.len() < file.stream_position()? {
-                file.rewind()?;
-                filter = history::Filter::default();
-            }
-            let n = file.read(&mut buf)?;
-            if n > 0 {
-                io::stdout().write_all(&filter.feed(&buf[..n]))?;
-            } else {
+            let progressed = follower.poll(|bytes, reset| {
+                if reset {
+                    filter = history::Filter::default();
+                }
+                io::stdout().write_all(&filter.feed(bytes))
+            })?;
+            if !progressed {
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }

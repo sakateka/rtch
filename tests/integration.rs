@@ -1,11 +1,11 @@
 //! Real process, Unix socket and PTY checks; run with cargo test.
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{DirBuilderExt, FileTypeExt, PermissionsExt, symlink},
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt, symlink},
             net::{UnixListener, UnixStream},
         },
     },
@@ -23,6 +23,27 @@ use std::{
 #[allow(dead_code)]
 #[path = "../src/os.rs"]
 mod os;
+
+#[allow(dead_code)]
+#[path = "../src/history.rs"]
+mod history;
+
+#[allow(dead_code)]
+#[path = "../src/logfile.rs"]
+mod logfile;
+mod storage {
+    pub fn open_file(path: &std::path::Path, _: bool) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(path)
+    }
+}
+fn decoded(path: impl AsRef<std::path::Path>) -> Vec<u8> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    logfile::read(&mut file, 256 * 1024 * 1024, true)
+        .unwrap()
+        .bytes
+}
 
 #[path = "support/screen.rs"]
 mod screen;
@@ -181,7 +202,7 @@ impl Sessions {
         });
     }
     fn log(&self, name: &str) -> Vec<u8> {
-        fs::read(self.sessions.join(format!("{name}.log"))).unwrap_or_default()
+        decoded(self.sessions.join(format!("{name}.log")))
     }
     fn attach(&self, args: &[&str]) -> Client {
         Self::terminal(
@@ -332,7 +353,7 @@ fn recursive_session_opening_is_rejected_before_terminal_or_session_changes() {
     s.ok(&["start", "occupied", "printf", "PRESERVED_HISTORY"]);
     s.ended("occupied");
     let old_log = s.log("occupied");
-    let old_head = fs::read(s.sessions.join("occupied.head")).unwrap();
+    let old_head = decoded(s.sessions.join("occupied.head"));
     let args = [
         vec![],
         vec!["pick"],
@@ -371,10 +392,7 @@ fn recursive_session_opening_is_rejected_before_terminal_or_session_changes() {
         assert!(!s.sessions.join("nested.head").exists());
         assert!(!s.sessions.join("occupied").exists());
         assert_eq!(s.log("occupied"), old_log);
-        assert_eq!(
-            fs::read(s.sessions.join("occupied.head")).unwrap(),
-            old_head
-        );
+        assert_eq!(decoded(s.sessions.join("occupied.head")), old_head);
         assert!(s.sessions.join("occupied.ended").exists());
     }
 
@@ -696,10 +714,14 @@ fn clear_acknowledged_and_rotation_bounded() {
         "head -c 30000 /dev/zero; printf READY; sleep 60",
     ]);
     wait_for(|| contains(&s.log("rotate"), b"READY"));
-    assert!(s.log("rotate").len() <= 2048);
+    assert!(
+        fs::metadata(s.sessions.join("rotate.log")).unwrap().len()
+            + fs::metadata(s.sessions.join("rotate.head")).unwrap().len()
+            <= 1024
+    );
     s.ok(&["clear", "rotate"]);
     assert!(s.log("rotate").is_empty());
-    assert!(fs::read(s.sessions.join("rotate.head")).unwrap().is_empty());
+    assert!(decoded(s.sessions.join("rotate.head")).is_empty());
 }
 #[test]
 fn run_returns_child_exit_status() {
@@ -885,7 +907,7 @@ fn picker_restarts_ended_and_stale_sessions_preserving_history() {
         s.ended(name);
         let old_log = s.log(name);
         let head = s.sessions.join(format!("{name}.head"));
-        let old_head = fs::read(&head).unwrap();
+        let old_head = decoded(&head);
         assert!(!old_log.is_empty() && !old_head.is_empty());
         if stale {
             drop(UnixListener::bind(s.sessions.join(name)).unwrap());
@@ -899,7 +921,7 @@ fn picker_restarts_ended_and_stale_sessions_preserving_history() {
         assert!(s.sessions.join(name).exists());
         wait_for(|| !s.sessions.join(format!("{name}.ended")).exists());
         assert!(s.log(name).starts_with(&old_log));
-        assert!(fs::read(head).unwrap().starts_with(&old_head));
+        assert!(decoded(head).starts_with(&old_head));
         c.master.write_all(b"printf 'AFTER_RESTART\\n'\n").unwrap();
         c.read_until(b"AFTER_RESTART");
         wait_for(|| contains(&s.log(name), b"AFTER_RESTART"));
@@ -947,14 +969,14 @@ fn picker_restarts_socket_only_stale_with_current_shell_and_directory() {
 
 #[test]
 fn picker_restart_keeps_existing_smaller_cap_and_disabled_logging_policy() {
-    for cap in ["16", "0"] {
+    for cap in ["256", "0"] {
         let s = Sessions::new();
         let old_output = format!("{}OLD_TAIL\n", "a".repeat(100));
         s.ok(&["start", "retained", "printf", "%s", &old_output]);
         s.ended("retained");
         let old_log = s.log("retained");
         let head = s.sessions.join("retained.head");
-        let old_head = fs::read(&head).unwrap();
+        let old_head = decoded(&head);
         fs::write(s.root.join(".profile"), "printf 'NEW_OUTPUT'\nsleep 60\n").unwrap();
         let mut c = s.attach(&["-C", cap, "pick"]);
         c.read_until(b"scroll");
@@ -962,19 +984,18 @@ fn picker_restart_keeps_existing_smaller_cap_and_disabled_logging_policy() {
         c.read_until(b"NEW_OUTPUT");
         if cap == "0" {
             assert_eq!(s.log("retained"), old_log);
-            assert_eq!(fs::read(head).unwrap(), old_head);
+            assert_eq!(decoded(head), old_head);
         } else {
-            let retained = &old_log[old_log.len() - 16..];
             wait_for(|| contains(&s.log("retained"), b"NEW_OUTPUT"));
-            let log = s.log("retained");
+            assert!(s.log("retained").ends_with(b"NEW_OUTPUT"));
+            assert!(decoded(head).starts_with(&old_head));
             assert!(
-                log.starts_with(retained),
-                "retained suffix: {retained:?}; log: {log:?} ({:?}); head: {:?}",
-                String::from_utf8_lossy(&log),
-                fs::read(&head).unwrap()
+                fs::metadata(s.sessions.join("retained.log")).unwrap().len()
+                    + fs::metadata(s.sessions.join("retained.head"))
+                        .unwrap()
+                        .len()
+                    <= 256
             );
-            assert!(log.len() <= 32);
-            assert_eq!(fs::read(head).unwrap(), old_head[..16]);
         }
         c.detach();
         c.restored();
@@ -1472,7 +1493,7 @@ fn picker_standard_keys_create_edit_and_cancel_names_without_management() {
     s.ok(&["start", "saved", "printf", "PRESERVED_HISTORY"]);
     s.ended("saved");
     let history = s.log("saved");
-    let head = fs::read(s.sessions.join("saved.head")).unwrap();
+    let head = decoded(s.sessions.join("saved.head"));
     let marker = fs::read(s.sessions.join("saved.ended")).unwrap();
     let shell = s.root.join("test-shell");
     fs::write(
@@ -1540,7 +1561,7 @@ fn picker_standard_keys_create_edit_and_cancel_names_without_management() {
     let out = c.read_until(b"scroll");
     assert!(contains(&out, "New: 界jkhlqdcnолрдйвст".as_bytes()));
     assert_eq!(s.log("saved"), history);
-    assert_eq!(fs::read(s.sessions.join("saved.head")).unwrap(), head);
+    assert_eq!(decoded(s.sessions.join("saved.head")), head);
     assert_eq!(fs::read(s.sessions.join("saved.ended")).unwrap(), marker);
     c.master
         .write_all(b"\x1b[F\x1b[200~\x1b[2~\x1b[3~\x1bOQ\x1b[12~\x1b[1Q\x1b[1;1Q\x1b[201~")
@@ -1914,7 +1935,7 @@ fn picker_live_delete_refusal_and_clear_preserve_process_and_attachment() {
             c
         });
         let history = s.log("live");
-        let head = fs::read(s.sessions.join("live.head")).unwrap();
+        let head = decoded(s.sessions.join("live.head"));
         let mut picker = s.attach(&["pick"]);
         picker.read_until(b"scroll");
         picker.master.write_all(delete.as_bytes()).unwrap();
@@ -1925,7 +1946,7 @@ fn picker_live_delete_refusal_and_clear_preserve_process_and_attachment() {
             if attached { b"attached" } else { b"running" }
         ));
         assert_eq!(s.log("live"), history);
-        assert_eq!(fs::read(s.sessions.join("live.head")).unwrap(), head);
+        assert_eq!(decoded(s.sessions.join("live.head")), head);
         assert_eq!(fs::read(&pid_file).unwrap(), pid);
         assert!(s.sessions.join("live").exists());
         assert!(picker.child.0.try_wait().unwrap().is_none());
@@ -1937,7 +1958,7 @@ fn picker_live_delete_refusal_and_clear_preserve_process_and_attachment() {
         assert!(contains(&out, b"Logs cleaned"));
         assert_eq!(text(&out).matches("(No output recorded.)").count(), 2);
         assert!(s.log("live").is_empty());
-        assert!(fs::read(s.sessions.join("live.head")).unwrap().is_empty());
+        assert!(decoded(s.sessions.join("live.head")).is_empty());
         assert!(s.sessions.join("live").exists());
         assert_eq!(fs::read(&pid_file).unwrap(), pid);
         if let Some(c) = &mut live {
@@ -1956,12 +1977,12 @@ fn picker_live_delete_refusal_and_clear_preserve_process_and_attachment() {
             s.push("live", b"output-to-rotate-the-retained-log\n");
         }
         wait_for(|| contains(&s.log("live"), b"NEW_output-to-rotate"));
-        assert!(s.log("live").len() <= 512);
         assert!(
-            fs::read(s.sessions.join("live.head"))
-                .unwrap()
-                .starts_with(b"after-clear")
+            fs::metadata(s.sessions.join("live.log")).unwrap().len()
+                + fs::metadata(s.sessions.join("live.head")).unwrap().len()
+                <= 256
         );
+        assert!(decoded(s.sessions.join("live.head")).starts_with(b"after-clear"));
         picker.master.write_all(b"q").unwrap();
         picker.read_until(b"\x1b[?1049l");
         assert!(picker.child.wait().success());
@@ -2004,7 +2025,7 @@ fn picker_offline_clear_preserves_identity_marker_and_stale_socket() {
         assert!(screen.row(8).contains("● Ending"));
         assert_eq!(text(&out).matches("(No output recorded.)").count(), 2);
         assert!(s.log("saved").is_empty());
-        assert!(fs::read(s.sessions.join("saved.head")).unwrap().is_empty());
+        assert!(decoded(s.sessions.join("saved.head")).is_empty());
         assert_eq!(fs::read(s.sessions.join("saved.ended")).unwrap(), marker);
         assert_eq!(socket.exists(), stale);
         assert!(contains(
@@ -2050,7 +2071,7 @@ fn picker_actions_revalidate_changed_and_missing_selections() {
 }
 
 #[test]
-fn picker_partial_clear_error_refreshes_and_preserves_focus_and_selection() {
+fn picker_clear_validates_both_files_and_preserves_focus_and_selection() {
     let s = Sessions::new();
     for name in ["other", "selected"] {
         s.ok(&["start", name, "printf", "SAVED_HISTORY"]);
@@ -2072,8 +2093,8 @@ fn picker_partial_clear_error_refreshes_and_preserves_focus_and_selection() {
     assert!(screen.row(5).contains("● Beginning"));
     assert!(contains(&out, b"Cannot clean"));
     assert!(contains(&out, b"History unavailable"));
-    assert!(contains(&out, b"(No output recorded.)"));
-    assert!(s.log("selected").is_empty());
+    assert!(contains(&out, b"SAVED_HISTORY"));
+    assert_eq!(s.log("selected"), b"SAVED_HISTORY");
     assert_eq!(s.log("other"), other);
     assert_eq!(fs::read(victim).unwrap(), b"PRESERVE_TARGET");
     c.master.write_all(b"q").unwrap();
@@ -2223,7 +2244,7 @@ fn picker_hidden_selection_requires_resize_before_delete_or_clean() {
     s.ok(&["start", "hidden", "printf", "PRESERVED_HISTORY"]);
     s.ended("hidden");
     let log = s.log("hidden");
-    let head = fs::read(s.sessions.join("hidden.head")).unwrap();
+    let head = decoded(s.sessions.join("hidden.head"));
     let marker = fs::read(s.sessions.join("hidden.ended")).unwrap();
     let mut c = s.attach(&["pick"]);
     c.read_until(b"scroll");
@@ -2245,7 +2266,7 @@ fn picker_hidden_selection_requires_resize_before_delete_or_clean() {
             let out = c.read_until(if width == 20 { b"Esc exit" } else { b"scroll" });
             assert!(contains(&out, b"Resize before"));
             assert_eq!(s.log("hidden"), log);
-            assert_eq!(fs::read(s.sessions.join("hidden.head")).unwrap(), head);
+            assert_eq!(decoded(s.sessions.join("hidden.head")), head);
             assert_eq!(fs::read(s.sessions.join("hidden.ended")).unwrap(), marker);
         }
     }
@@ -2584,13 +2605,13 @@ fn picker_revalidates_changed_states_at_enter() {
     s.ended("changed");
     let old_log = s.log("changed");
     let head = s.sessions.join("changed.head");
-    let old_head = fs::read(&head).unwrap();
+    let old_head = decoded(&head);
     fs::write(s.root.join(".profile"), "printf 'CHANGED_RESTARTED\\n'\n").unwrap();
     picker.master.write_all(b"\r").unwrap();
     picker.read_until(b"CHANGED_RESTARTED");
     assert!(s.sessions.join("changed").exists());
     assert!(s.log("changed").starts_with(&old_log));
-    assert!(fs::read(head).unwrap().starts_with(&old_head));
+    assert!(decoded(head).starts_with(&old_head));
     picker.detach();
     picker.restored();
 
@@ -2708,5 +2729,149 @@ fn legacy_head_sessions_keep_socket_priority_access_and_safe_removal() {
         !s.run(&["start", "fresh.head", "true"], b"")
             .status
             .success()
+    );
+}
+
+#[test]
+fn compressed_tail_follow_streams_rotation_clear_restart_and_legacy_migration_once() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let s = Sessions::new();
+    let log_path = s.sessions.join("follow.log");
+    let mut legacy = File::options()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&log_path)
+        .unwrap();
+    legacy.write_all(b"LEGACY_SEEN\n").unwrap();
+    let output = s.root.join("follow.out");
+    let mut follower = Process(
+        s.command(BINARY)
+            .args(["tail", "-f", "-n", "1", "follow"])
+            .stdout(File::create(&output).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for(|| contains(&fs::read(&output).unwrap(), b"LEGACY_SEEN"));
+    legacy.write_all(b"LEGACY_LIVE\n").unwrap();
+    wait_for(|| contains(&fs::read(&output).unwrap(), b"LEGACY_LIVE"));
+    drop(legacy);
+    s.ok(&[
+        "start",
+        "-C",
+        "1k",
+        "follow",
+        "sh",
+        "-c",
+        "stty -echo; printf 'COMPRESSED_READY\\n'; while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+    ]);
+    wait_for(|| contains(&fs::read(&output).unwrap(), b"COMPRESSED_READY"));
+    let original_inode = fs::metadata(&log_path).unwrap().ino();
+    for i in 0..30 {
+        let message = format!("unique followed message {i:03}\n");
+        s.push("follow", message.as_bytes());
+        wait_for(|| contains(&fs::read(&output).unwrap(), message.trim_end().as_bytes()));
+        assert!(
+            fs::metadata(&log_path).unwrap().len()
+                + fs::metadata(s.sessions.join("follow.head")).unwrap().len()
+                <= 1024
+        );
+    }
+    assert_ne!(fs::metadata(&log_path).unwrap().ino(), original_inode);
+    s.ok(&["clear", "follow"]);
+    s.push("follow", b"AFTER_CLEAR_ONCE\n");
+    wait_for(|| contains(&fs::read(&output).unwrap(), b"AFTER_CLEAR_ONCE"));
+    s.ok(&["kill", "-f", "follow"]);
+    s.ended("follow");
+    s.ok(&[
+        "start",
+        "-C",
+        "1k",
+        "follow",
+        "printf",
+        "AFTER_RESTART_ONCE\n",
+    ]);
+    s.ended("follow");
+    wait_for(|| contains(&fs::read(&output).unwrap(), b"AFTER_RESTART_ONCE"));
+    signal_child(&follower.0, "-TERM");
+    assert!(follower.wait().success());
+    let bytes = fs::read(output).unwrap();
+    let lines = String::from_utf8(bytes).unwrap();
+    for expected in [
+        "LEGACY_SEEN",
+        "LEGACY_LIVE",
+        "COMPRESSED_READY",
+        "AFTER_CLEAR_ONCE",
+        "AFTER_RESTART_ONCE",
+    ] {
+        assert_eq!(lines.matches(expected).count(), 1, "{lines}");
+    }
+    for i in 0..30 {
+        assert_eq!(
+            lines
+                .matches(&format!("unique followed message {i:03}"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn compressed_tail_expands_only_when_needed_and_reads_legacy_without_migration() {
+    use std::{fmt::Write as _, os::unix::fs::OpenOptionsExt};
+    let s = Sessions::new();
+    let mut history = String::new();
+    for i in 0..20_000 {
+        writeln!(history, "number {i:05} some padded history text").unwrap();
+    }
+    let source = s.root.join("history.fixture");
+    fs::write(&source, &history).unwrap();
+    s.ok(&["start", "long-tail", "cat", source.to_str().unwrap()]);
+    s.ended("long-tail");
+    let tail = s.ok(&["tail", "-n", "3", "long-tail"]);
+    let mut expected = String::new();
+    for line in history.lines().skip(19_997) {
+        write!(expected, "{line}\r\n").unwrap();
+    }
+    assert_eq!(tail, expected.as_bytes());
+    let larger = s.ok(&["tail", "-n", "12000", "long-tail"]);
+    assert_eq!(larger.split(|&byte| byte == b'\n').count() - 1, 12_000);
+    let compressed = s.sessions.join("long-tail.log");
+    let mut file = File::options()
+        .read(true)
+        .write(true)
+        .open(&compressed)
+        .unwrap();
+    let end = file.metadata().unwrap().len();
+    let record = logfile::next(&mut file, logfile::HEADER_SIZE, end)
+        .unwrap()
+        .unwrap();
+    file.seek(SeekFrom::Start(record.end - 25)).unwrap();
+    let mut byte = [0];
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 1;
+    file.seek(SeekFrom::Start(record.end - 25)).unwrap();
+    file.write_all(&byte).unwrap();
+    assert_eq!(s.ok(&["tail", "-n", "3", "long-tail"]), expected.as_bytes());
+    assert!(
+        !s.run(&["tail", "-n", "40000", "long-tail"], b"")
+            .status
+            .success()
+    );
+    let legacy = s.sessions.join("plain.log");
+    File::options()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&legacy)
+        .unwrap()
+        .write_all(b"old plaintext\nrecent plaintext\n")
+        .unwrap();
+    assert_eq!(s.ok(&["tail", "-n", "1", "plain"]), b"recent plaintext\n");
+    assert_eq!(
+        fs::read(legacy).unwrap(),
+        b"old plaintext\nrecent plaintext\n"
     );
 }

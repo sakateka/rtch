@@ -19,7 +19,7 @@ pub fn take_signals() -> i32 {
 }
 pub fn lock(fd: RawFd) -> io::Result<()> {
     loop {
-        // SAFETY: flock borrows the open directory descriptor for this call.
+        // SAFETY: flock borrows the open descriptor for this call.
         if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
             return Ok(());
         }
@@ -30,7 +30,7 @@ pub fn lock(fd: RawFd) -> io::Result<()> {
     }
 }
 pub fn try_lock(fd: RawFd) -> io::Result<bool> {
-    // SAFETY: flock borrows the open directory descriptor for this call.
+    // SAFETY: flock borrows the open descriptor for this call.
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(true);
     }
